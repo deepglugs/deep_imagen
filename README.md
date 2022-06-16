@@ -40,3 +40,28 @@ The subdirectories doesn't really matter, only the filenames matter.
 python3 imagen.py --train --source /path/to/dataset --imagen yourmodel.pth
 ```
 
+## gel_fetch.py
+
+Included is a tool to fetch data from *booru-style websites and creates tag files 
+in the expected format.
+
+### Setup:
+You will need GelbooruViewr and pybooru to run.
+
+First clone GelbooruViewr into the deep-imagen repo:
+```bash
+cd path/to/deep-imagen/
+git clone https://github.com/ArchieMeng/GelbooruViewer
+````
+
+```bash
+python3 -m pip install git+https://github.com/LuqueDaniel/pybooru
+```
+
+### Usage
+
+```bash
+python3 gel_fetch.py --tags "holo" --txt holo/tags --img holo/imgs --danbooru
+```
+
+
