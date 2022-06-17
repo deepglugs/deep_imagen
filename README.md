@@ -46,9 +46,9 @@ Included is a tool to fetch data from *booru-style websites and creates tag file
 in the expected format.
 
 ### Setup:
-You will need GelbooruViewr and pybooru to run.
+You will need GelbooruViewer and pybooru to run.
 
-First clone GelbooruViewr into the deep-imagen repo:
+First clone GelbooruViewer into the deep-imagen repo:
 ```bash
 cd path/to/deep-imagen/
 git clone https://github.com/ArchieMeng/GelbooruViewer
