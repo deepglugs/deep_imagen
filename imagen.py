@@ -1,4 +1,5 @@
 import math
+import numbers
 import os
 import time
 from collections import deque
@@ -13,12 +14,50 @@ from imagen_pytorch import Unet, Imagen, ImagenTrainer
 from gan_utils import get_images, get_vocab
 from data_generator import ImageLabelDataset
 
+
+def get_padding(image):    
+    w, h = image.size
+    max_wh = np.max([w, h])
+    h_padding = (max_wh - w) / 2
+    v_padding = (max_wh - h) / 2
+    l_pad = h_padding if h_padding % 1 == 0 else h_padding+0.5
+    t_pad = v_padding if v_padding % 1 == 0 else v_padding+0.5
+    r_pad = h_padding if h_padding % 1 == 0 else h_padding-0.5
+    b_pad = v_padding if v_padding % 1 == 0 else v_padding-0.5
+    padding = (int(l_pad), int(t_pad), int(r_pad), int(b_pad))
+    return padding
+
+
+class PadImage(object):
+    def __init__(self, fill=0, padding_mode='constant'):
+        assert isinstance(fill, (numbers.Number, str, tuple))
+        assert padding_mode in ['constant', 'edge', 'reflect', 'symmetric']
+
+        self.fill = fill
+        self.padding_mode = padding_mode
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL Image): Image to be padded.
+
+        Returns:
+            PIL Image: Padded image.
+        """
+        return VTF.pad(img, get_padding(img), self.fill, self.padding_mode)
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(padding={0}, fill={1}, padding_mode={2})'.\
+            format(self.fill, self.padding_mode)
+
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source', type=str, default=None)
-    parser.add_argument('--tags_source', type=str, default=None)
+    parser.add_argument('--source', type=str, default=None, help="image source")
+    parser.add_argument('--tags_source', type=str, default=None, help="tag files. will use --source if not specified.")
+    parser.add_argument('--poses', type=str, default=None)
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
     parser.add_argument('--size', default=128, type=int)
@@ -131,7 +170,7 @@ def get_imagen(args):
             num_resnet_blocks = (2, 4, 8, 8),
             layer_attns = (False, False, False, True),
             layer_cross_attns = (False, False, False, True),
-            memory_efficient=False
+            memory_efficient=True
         )
 
         unets.append(unet2)
@@ -148,7 +187,10 @@ def get_imagen(args):
         continuous_times=True,
         p2_loss_weight_gamma=1.0,
         text_encoder_name='t5-large',
+        noise_schedules=["cosine", "cosine"],
+        pred_objectives=["noise", "x_start"],
         image_sizes=image_sizes,
+        per_sample_random_aug_noise_level=True,
         timesteps=1000
     ).cuda()
 
@@ -172,7 +214,15 @@ def train(args):
     txts = get_images(args.tags_source, exts=".txt")
     vocab = get_vocab(args.vocab, top=args.vocab_limit)
 
+    poses = None
+    has_poses = False
+
+    if args.poses is not None:
+        poses = get_images(args.poses)
+        has_poses = True
+
     tforms = transforms.Compose([
+            PadImage(),
             transforms.Resize((args.size, args.size)),
             transforms.ToTensor()])
             # transforms.RandomHorizontalFlip(),
@@ -193,6 +243,7 @@ def train(args):
         return txt
 
     data = ImageLabelDataset(imgs, txts, vocab,
+                             poses=poses,
                              dim=(args.size, args.size),
                              transform=tforms,
                              tag_transform=txt_xforms,
@@ -206,7 +257,7 @@ def train(args):
                                      num_workers=8)
 
 
-    disp_size = 4
+    disp_size = min(args.batch_size, 4)
     rate = deque([1], maxlen=5)
 
     os.makedirs(args.samples_out, exist_ok=True)
@@ -217,9 +268,18 @@ def train(args):
                   '1girl, from_behind, wristwatch']
 
 
+    sample_poses = None
+
     for epoch in range(1, args.epochs + 1):
         step = 0
-        for images, texts in dl:
+        for data in dl:
+
+            if has_poses:
+                images, texts, poses = data
+            else:
+                images, texts = data
+                poses = None
+
             step += 1
 
             t1 = time.monotonic()
@@ -227,6 +287,7 @@ def train(args):
             for i in range(len(imagen.unets)):
                 loss = trainer(
                     images,
+                    poses=poses,
                     texts = texts,
                     unet_number = i + 1,
                     max_batch_size = args.micro_batch_size
@@ -249,13 +310,21 @@ def train(args):
                       round(np.mean(rate), 2)))
 
             if step % 1000 == 0:
+                if poses is not None and sample_poses is None:
+                    sample_poses = poses[:disp_size]
+
                 sample_images = trainer.sample(texts=sample_texts,
-                                       cond_scale=7.,
-                                       return_all_unet_outputs=True)
+                                               poses=sample_poses,
+                                               cond_scale=7.,
+                                               return_all_unet_outputs=True)
 
                 sample_images0 = transforms.Resize(args.size)(sample_images[0])
                 sample_images1 = transforms.Resize(args.size)(sample_images[1])
                 sample_images = torch.cat([sample_images0, sample_images1])
+
+                if poses is not None:
+                    sample_poses0 = transforms.Resize(args.size)(sample_poses)
+                    sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
 
                 grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
                 VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
@@ -263,13 +332,21 @@ def train(args):
                 if args.imagen is not None:
                     trainer.save(args.imagen)
 
+        if poses is not None and sample_poses is None:
+            sample_poses = poses[:disp_size]
+
         sample_images = trainer.sample(texts=sample_texts,
+                                       poses=poses,
                                        cond_scale=7.,
                                        return_all_unet_outputs=True)
 
         sample_images0 = transforms.Resize(args.size)(sample_images[0])
         sample_images1 = transforms.Resize(args.size)(sample_images[1])
         sample_images = torch.cat([sample_images0, sample_images1])
+
+        if poses is not None:
+            sample_poses0 = transforms.Resize(args.size)(sample_poses)
+            sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
 
         grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
         VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))

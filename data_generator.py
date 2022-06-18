@@ -218,9 +218,14 @@ class DataGenerator():
 
 class ImageLabelDataset():
     def __init__(self, images, txts, vocab,
-                 to_fit=True, dim=(256, 256),
-                 n_channels=3, shuffle=True, transform=None,
-                 normalize=True, ret_filenames=False,
+                 poses=None,
+                 to_fit=True, 
+                 dim=(256, 256),
+                 n_channels=3,
+                 shuffle=True,
+                 transform=None,
+                 normalize=True,
+                 ret_filenames=False,
                  channels_first=False,
                  tag_transform=None,
                  silent=True,
@@ -233,6 +238,8 @@ class ImageLabelDataset():
         self.images = images
         self.txts = txts
         self.vocab = vocab
+        self.poses = poses
+        self.has_poses = True if poses is not None else False
         self.to_fit = to_fit
         self.batch_size = 1
         self.dim = dim
@@ -260,9 +267,12 @@ class ImageLabelDataset():
         self.normalize = normalize
 
         self.txts_oh = {}
+        self.poses_preload = {}
 
         if not no_preload:
             self._preload_txts()
+            if self.has_poses:
+                self._preload_poses()
 
     def _preload_txts(self, images=None):
         # print("preloading txt files...")
@@ -308,7 +318,36 @@ class ImageLabelDataset():
             except KeyError:
                 continue
 
-        # print("\ndone preloading txt onehots")
+    def _preload_poses(self, images=None):
+        # print("preloading pose files...")
+
+        if images is None:
+            images = self.images
+
+        tot = len(images)
+        count = 0
+
+        poses = {}
+
+        for pose in self.poses:
+            bn = os.path.basename(pose)
+
+            bn = os.path.splitext(bn)[0]
+
+            poses[bn] = pose
+
+        for img in images:
+            count += 1
+            # print("\rprocessing {}/{}".format(count, tot), end='', flush=True)
+
+            bn = os.path.basename(img)
+            bn = os.path.splitext(bn)[0]
+
+            try:
+                pose = poses[bn]
+                self.poses_preload[bn] = pose
+            except KeyError:
+                continue
 
     def __len__(self):
         """Denotes the number of batches per epoch
@@ -436,6 +475,18 @@ class ImageLabelDataset():
         # print(txt_from_onehot(self.vocab, self.txts_oh[bn]))
 
         # print(f"loading {img}")
+
+        if self.has_poses:
+            pose = self.poses_preload.get(bn, None)
+
+            if pose is None:
+                self._preload_poses(images=[img])
+                pose = self.poses_preload[bn]
+
+            the_pose = Image.open(pose).convert("RGB")
+            the_pose = self.transform(the_pose)
+
+            return X, y, the_pose
 
         if self.ret_filenames:
             return fn, X, y
