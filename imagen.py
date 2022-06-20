@@ -9,6 +9,7 @@ import torch
 from torchvision import transforms
 from torchvision.transforms import functional as VTF
 from torchvision.utils import make_grid, save_image
+from PIL import Image
 
 from imagen_pytorch import Unet, Imagen, ImagenTrainer
 from gan_utils import get_images, get_vocab
@@ -104,7 +105,17 @@ def sample(args):
         print(f"Error loading model: {args.imagen}")
         return
 
+    cond_image = None
+
+    if args.poses is not None and os.path.isfile(args.poses):
+        tforms = transforms.Compose([PadImage(),
+                                     transforms.Resize((args.size, args.size)),
+                                     transforms.ToTensor()])
+        cond_image = Image.open(args.poses)
+        cond_image = tforms(cond_image).to(imagen.device)
+
     sample_images = imagen.sample(texts=[args.tags],
+                                  cond_images=cond_image.view(1, *cond_image.shape),
                                   cond_scale=7.,
                                   return_pil_images=True)
 
@@ -150,13 +161,22 @@ def load(imagen, path):
 
 
 def get_imagen(args):
+
+
+    if args.poses is not None:
+        cond_images_channels = 3
+    else:
+        cond_images_channels = 0
+
     unet1 = Unet(
     # unet for imagen
         dim = args.unet_dims,
         cond_dim = 512,
         dim_mults = (1, 2, 4, 8),
+        cond_images_channels=cond_images_channels,
         num_resnet_blocks = 3,
         layer_attns = (False, True, True, True)
+
     )
 
     unets = [unet1]
@@ -167,6 +187,7 @@ def get_imagen(args):
             dim = 32,
             cond_dim = 512,
             dim_mults = (1, 2, 4, 8),
+            cond_images_channels=cond_images_channels,
             num_resnet_blocks = (2, 4, 8, 8),
             layer_attns = (False, False, False, True),
             layer_cross_attns = (False, False, False, True),
@@ -287,7 +308,7 @@ def train(args):
             for i in range(len(imagen.unets)):
                 loss = trainer(
                     images,
-                    poses=poses,
+                    cond_images=poses,
                     texts = texts,
                     unet_number = i + 1,
                     max_batch_size = args.micro_batch_size
@@ -314,7 +335,7 @@ def train(args):
                     sample_poses = poses[:disp_size]
 
                 sample_images = trainer.sample(texts=sample_texts,
-                                               poses=sample_poses,
+                                               cond_images=sample_poses,
                                                cond_scale=7.,
                                                return_all_unet_outputs=True)
 
@@ -336,7 +357,7 @@ def train(args):
             sample_poses = poses[:disp_size]
 
         sample_images = trainer.sample(texts=sample_texts,
-                                       poses=poses,
+                                       cond_images=sample_poses,
                                        cond_scale=7.,
                                        return_all_unet_outputs=True)
 
