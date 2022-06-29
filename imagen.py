@@ -61,14 +61,16 @@ def main():
     parser.add_argument('--poses', type=str, default=None)
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
-    parser.add_argument('--size', default=128, type=int)
+    parser.add_argument('--size', default=256, type=int)
     parser.add_argument('--num_unets', default=1, type=int, help="additional unet networks")
     parser.add_argument('--vocab_limit', default=None, type=int)
     parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--imagen', default="imagen.pth")
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--replace', action='store_true', help="replace the output file")
-    parser.add_argument('--unet_dims', default=32, type=int)
+    parser.add_argument('--unet_dims', default=128, type=int)
+    parser.add_argument('--unet2_dims', default=64, type=int)
+
     # training
     parser.add_argument('--batch_size', default=8, type=int)
     parser.add_argument('--micro_batch_size', default=8, type=int)
@@ -76,6 +78,8 @@ def main():
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--shuffle_tags', action='store_true')
     parser.add_argument('--dp', action='store_true')
+    parser.add_argument('--train_unet', type=int, default=0)
+
 
     args = parser.parse_args()
 
@@ -94,13 +98,11 @@ def main():
 
 def sample(args):
 
-    imagen = get_imagen(args)
-
     if os.path.isfile(args.output) and not args.replace:
         return
 
     try:
-        imagen = load(imagen, args.imagen)
+        imagen = load(args, args.imagen)
     except:
         print(f"Error loading model: {args.imagen}")
         return
@@ -113,9 +115,10 @@ def sample(args):
                                      transforms.ToTensor()])
         cond_image = Image.open(args.poses)
         cond_image = tforms(cond_image).to(imagen.device)
+        cond_image = cond_image.view(1, *cond_image.shape)
 
     sample_images = imagen.sample(texts=[args.tags],
-                                  cond_images=cond_image.view(1, *cond_image.shape),
+                                  cond_images=cond_image,
                                   cond_scale=7.,
                                   return_pil_images=True)
 
@@ -146,9 +149,14 @@ def save(imagen, path):
     torch.save(out, path)
 
 
-def load(imagen, path):
+def load(args, path):
 
     to_load = torch.load(path)
+
+    unet1_dims = to_load.get("unet1_dims", args.unet_dims)
+    unet2_dims = to_load.get("unet2_dims", args.unet2_dims)
+
+    imagen = get_imagen(args, unet1_dims, unet2_dims)
 
     try:
         imagen.load_state_dict(to_load["model"], strict=True)
@@ -160,8 +168,13 @@ def load(imagen, path):
     return imagen
 
 
-def get_imagen(args):
+def get_imagen(args, unet_dims=None, unet2_dims=None):
 
+    if unet_dims is None:
+        unet_dims = args.unet_dims
+
+    if unet2_dims is None:
+        unet2_dims = args.unet2_dims
 
     if args.poses is not None:
         cond_images_channels = 3
@@ -170,13 +183,13 @@ def get_imagen(args):
 
     unet1 = Unet(
     # unet for imagen
-        dim = args.unet_dims,
+        dim = unet_dims,
         cond_dim = 512,
-        dim_mults = (1, 2, 4, 8),
+        dim_mults = (1, 2, 3, 4),
         cond_images_channels=cond_images_channels,
         num_resnet_blocks = 3,
-        layer_attns = (False, True, True, True)
-
+        layer_attns = (False, True, True, True),
+        memory_efficient=False
     )
 
     unets = [unet1]
@@ -184,9 +197,9 @@ def get_imagen(args):
     for i in range(args.num_unets):
 
         unet2 = Unet(
-            dim = 32,
+            dim = unet2_dims,
             cond_dim = 512,
-            dim_mults = (1, 2, 4, 8),
+            dim_mults = (1, 2, 3, 4),
             cond_images_channels=cond_images_channels,
             num_resnet_blocks = (2, 4, 8, 8),
             layer_attns = (False, False, False, True),
@@ -203,16 +216,19 @@ def get_imagen(args):
 
     image_sizes.append(args.size)
 
+    print(f"image_sizes={image_sizes}")
+
     imagen = Imagen(
         unets = unets,
         continuous_times=True,
-        p2_loss_weight_gamma=1.0,
+        p2_loss_weight_gamma=0.0,
         text_encoder_name='t5-large',
-        noise_schedules=["cosine", "cosine"],
-        pred_objectives=["noise", "x_start"],
+        # noise_schedules=["cosine", "cosine"],
+        # pred_objectives=["noise", "x_start"],
         image_sizes=image_sizes,
         per_sample_random_aug_noise_level=True,
-        timesteps=1000
+        timesteps=1000,
+        lowres_sample_noise_level=0.3
     ).cuda()
 
     return imagen
@@ -229,6 +245,7 @@ def train(args):
 
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
+        imagen = load(args, args.imagen)
         trainer.load(args.imagen)
 
     imgs = get_images(args.source, verify=False)
@@ -246,12 +263,6 @@ def train(args):
             PadImage(),
             transforms.Resize((args.size, args.size)),
             transforms.ToTensor()])
-            # transforms.RandomHorizontalFlip(),
-            # transforms.RandomVerticalFlip(),
-            # transforms.RandomRotation((-180, 180)),
-            # transforms.ColorJitter(0.15, 0.15, 0.15, 0.15),
-            # transforms.ToTensor(),
-            # transforms.Normalize((0.5,)*3, (0.5,)*3)])
 
     def txt_xforms(txt):
         # print(f"txt: {txt}")
@@ -277,16 +288,15 @@ def train(args):
                                      shuffle=True,
                                      num_workers=8)
 
-
     disp_size = min(args.batch_size, 4)
     rate = deque([1], maxlen=5)
 
     os.makedirs(args.samples_out, exist_ok=True)
 
-    sample_texts=['1girl, red_bikini, outdoors, pool',
-                  '2girls, blue_dress, eyes_closed, off_shoulder',
-                  '1girl, 1boy, long_hair, breasts, red_lingerie',
-                  '1girl, from_behind, wristwatch']
+    sample_texts=['1girl, red_bikini, outdoors, pool, brown_hair',
+                  '2girls, blue_dress, eyes_closed, off_shoulder, blonde_hair',
+                  '1girl, 1boy, long_hair, black_hair',
+                  '1girl, wristwatch']
 
 
     sample_poses = None
@@ -305,7 +315,7 @@ def train(args):
 
             t1 = time.monotonic()
             losses = []
-            for i in range(len(imagen.unets)):
+            for i in range(args.train_unet, len(imagen.unets)):
                 loss = trainer(
                     images,
                     cond_images=poses,
@@ -340,7 +350,7 @@ def train(args):
                                                return_all_unet_outputs=True)
 
                 sample_images0 = transforms.Resize(args.size)(sample_images[0])
-                sample_images1 = transforms.Resize(args.size)(sample_images[1])
+                sample_images1 = transforms.Resize(args.size)(sample_images[-1])
                 sample_images = torch.cat([sample_images0, sample_images1])
 
                 if poses is not None:
@@ -351,7 +361,8 @@ def train(args):
                 VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
 
                 if args.imagen is not None:
-                    trainer.save(args.imagen)
+                    trainer.save(args.imagen, unet1_dims=args.unet_dims,
+                                 unet2_dims=args.unet2_dims)
 
         if poses is not None and sample_poses is None:
             sample_poses = poses[:disp_size]
@@ -362,7 +373,7 @@ def train(args):
                                        return_all_unet_outputs=True)
 
         sample_images0 = transforms.Resize(args.size)(sample_images[0])
-        sample_images1 = transforms.Resize(args.size)(sample_images[1])
+        sample_images1 = transforms.Resize(args.size)(sample_images[-1])
         sample_images = torch.cat([sample_images0, sample_images1])
 
         if poses is not None:
@@ -373,7 +384,8 @@ def train(args):
         VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
 
         if args.imagen is not None:
-            trainer.save(args.imagen)
+            trainer.save(args.imagen, unet1_dims=args.unet_dims,
+                         unet2_dims=args.unet2_dims)
 
 
 if __name__ == "__main__":

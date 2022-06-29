@@ -39,6 +39,9 @@ def get_images(txt_out, img_out, tags, num=1000, start_id=0, no_animated=False, 
         ('User-Agent', 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/36.0.1941.0 Safari/537.36')]
     install_opener(opener)
 
+    if txt_out is None:
+        txt_out = os.path.join(img_out, "tags")
+
     os.makedirs(txt_out, exist_ok=True)
     os.makedirs(img_out, exist_ok=True)
 
