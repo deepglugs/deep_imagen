@@ -1,6 +1,7 @@
 import math
 import numbers
 import os
+import random
 import time
 from collections import deque
 
@@ -11,7 +12,8 @@ from torchvision.transforms import functional as VTF
 from torchvision.utils import make_grid, save_image
 from PIL import Image
 
-from imagen_pytorch import Unet, Imagen, ImagenTrainer
+from imagen_pytorch import ImagenTrainer, ElucidatedImagenConfig
+from imagen_pytorch import load_imagen_from_checkpoint
 from gan_utils import get_images, get_vocab
 from data_generator import ImageLabelDataset
 
@@ -62,6 +64,7 @@ def main():
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
     parser.add_argument('--size', default=256, type=int)
+    parser.add_argument('--sample_steps', default=None, type=int)
     parser.add_argument('--num_unets', default=1, type=int, help="additional unet networks")
     parser.add_argument('--vocab_limit', default=None, type=int)
     parser.add_argument('--epochs', default=100, type=int)
@@ -77,11 +80,13 @@ def main():
     parser.add_argument('--samples_out', default="samples")
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--shuffle_tags', action='store_true')
-    parser.add_argument('--dp', action='store_true')
     parser.add_argument('--train_unet', type=int, default=0)
-
+    parser.add_argument('--random_drop_tags', type=float, default=0.)
 
     args = parser.parse_args()
+
+    if args.sample_steps is None:
+        args.sample_steps = args.size
 
     if args.tags_source is None:
         args.tags_source = args.source
@@ -151,19 +156,7 @@ def save(imagen, path):
 
 def load(args, path):
 
-    to_load = torch.load(path)
-
-    unet1_dims = to_load.get("unet1_dims", args.unet_dims)
-    unet2_dims = to_load.get("unet2_dims", args.unet2_dims)
-
-    imagen = get_imagen(args, unet1_dims, unet2_dims)
-
-    try:
-        imagen.load_state_dict(to_load["model"], strict=True)
-    except RuntimeError:
-        print("Failed loading state dict. Trying partial load")
-        imagen.load_state_dict(restore_parts(imagen.state_dict(),
-                                             to_load))
+    imagen = load_imagen_from_checkpoint(path)
 
     return imagen
 
@@ -181,14 +174,14 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
     else:
         cond_images_channels = 0
 
-    unet1 = Unet(
     # unet for imagen
-        dim = unet_dims,
-        cond_dim = 512,
-        dim_mults = (1, 2, 3, 4),
+    unet1 = dict(
+        dim=unet_dims,
+        cond_dim=512,
+        dim_mults=(1, 2, 3, 4),
         cond_images_channels=cond_images_channels,
-        num_resnet_blocks = 3,
-        layer_attns = (False, True, True, True),
+        num_resnet_blocks=3,
+        layer_attns=(False, True, True, True),
         memory_efficient=False
     )
 
@@ -196,15 +189,16 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
     for i in range(args.num_unets):
 
-        unet2 = Unet(
-            dim = unet2_dims,
-            cond_dim = 512,
-            dim_mults = (1, 2, 3, 4),
+        unet2 = dict(
+            dim=unet2_dims // (i + 1),
+            cond_dim=512,
+            dim_mults=(1, 2, 3, 4),
             cond_images_channels=cond_images_channels,
-            num_resnet_blocks = (2, 4, 8, 8),
-            layer_attns = (False, False, False, True),
-            layer_cross_attns = (False, False, False, True),
-            memory_efficient=True
+            num_resnet_blocks=3,
+            layer_attns=(False, False, False, False),
+            layer_cross_attns=(False, False, False, True),
+            final_conv_kernel_size=1,
+            memory_efficient=False
         )
 
         unets.append(unet2)
@@ -218,39 +212,81 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
     print(f"image_sizes={image_sizes}")
 
-    imagen = Imagen(
-        unets = unets,
-        continuous_times=True,
-        p2_loss_weight_gamma=0.0,
+    sample_steps = [args.sample_steps] * (args.num_unets + 1)
+
+    imagen = ElucidatedImagenConfig(
+        unets=unets,
         text_encoder_name='t5-large',
+        num_sample_steps=sample_steps,
         # noise_schedules=["cosine", "cosine"],
         # pred_objectives=["noise", "x_start"],
         image_sizes=image_sizes,
         per_sample_random_aug_noise_level=True,
-        timesteps=1000,
         lowres_sample_noise_level=0.3
-    ).cuda()
+    ).create().cuda()
 
     return imagen
+
+
+def make_training_samples(poses, trainer, args, epoch, step):
+    sample_texts = ['1girl, red_bikini, bikini, outdoors, pool, brown_hair',
+                    '1girl, blue_dress, eyes_closed, blonde_hair',
+                    '1boy, black_hair',
+                    '1girl, wristwatch, blue_hair']
+
+    disp_size = min(args.batch_size, 4)
+    sample_poses = None
+
+    if poses is not None:
+        sample_poses = poses[:disp_size]
+
+
+    if poses is not None and sample_poses is None:
+        sample_poses = poses[:disp_size]
+
+    sample_images = trainer.sample(texts=sample_texts,
+                                   cond_images=sample_poses,
+                                   cond_scale=7.,
+                                   return_all_unet_outputs=True)
+
+    final_samples = None
+
+    if len(sample_images) > 1:
+        for si in sample_images:
+            sample_images1 = transforms.Resize(args.size)(si)
+            if final_samples is None:
+                final_samples = sample_images1
+                continue
+
+            sample_images1 = transforms.Resize(args.size)(si)
+            final_samples = torch.cat([final_samples, sample_images1])
+        sample_images = final_samples
+    else:
+        sample_images = sample_images[0]
+
+    if poses is not None:
+        sample_poses0 = transforms.Resize(args.size)(sample_poses)
+        sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
+
+    grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
+    VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
 
 
 def train(args):
 
     imagen = get_imagen(args)
 
-    trainer = ImagenTrainer(imagen)
-
-    if args.dp:
-        imagen = torch.nn.DataParallel(trainer)
-
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
-        imagen = load(args, args.imagen)
-        trainer.load(args.imagen)
+        imagen = load_imagen_from_checkpoint(args.imagen)
+
+    trainer = ImagenTrainer(imagen)
+
+    print("Fetching image indexes...")
 
     imgs = get_images(args.source, verify=False)
     txts = get_images(args.tags_source, exts=".txt")
-    vocab = get_vocab(args.vocab, top=args.vocab_limit)
+    # vocab = get_vocab(args.vocab, top=args.vocab_limit)
 
     poses = None
     has_poses = False
@@ -270,11 +306,19 @@ def train(args):
         if args.shuffle_tags:
             np.random.shuffle(txt)
 
+        r = int(len(txt) * args.random_drop_tags)
+
+        if r > 0:
+            rand_range = random.randrange(r)
+
+        if args.random_drop_tags > 0.0 and r > 0:
+            txt.pop(rand_range)
+
         txt = ", ".join(txt)
 
         return txt
 
-    data = ImageLabelDataset(imgs, txts, vocab,
+    data = ImageLabelDataset(imgs, txts, None,
                              poses=poses,
                              dim=(args.size, args.size),
                              transform=tforms,
@@ -287,19 +331,10 @@ def train(args):
                                      batch_size=args.batch_size,
                                      shuffle=True,
                                      num_workers=8)
-
-    disp_size = min(args.batch_size, 4)
+    
     rate = deque([1], maxlen=5)
 
     os.makedirs(args.samples_out, exist_ok=True)
-
-    sample_texts=['1girl, red_bikini, outdoors, pool, brown_hair',
-                  '2girls, blue_dress, eyes_closed, off_shoulder, blonde_hair',
-                  '1girl, 1boy, long_hair, black_hair',
-                  '1girl, wristwatch']
-
-
-    sample_poses = None
 
     for epoch in range(1, args.epochs + 1):
         step = 0
@@ -315,18 +350,19 @@ def train(args):
 
             t1 = time.monotonic()
             losses = []
-            for i in range(args.train_unet, len(imagen.unets)):
-                loss = trainer(
-                    images,
-                    cond_images=poses,
-                    texts = texts,
-                    unet_number = i + 1,
-                    max_batch_size = args.micro_batch_size
-                )
+            i = args.train_unet
 
-                trainer.update(unet_number=i + 1)
+            loss = trainer(
+                images,
+                cond_images=poses,
+                texts=texts,
+                unet_number=i + 1,
+                max_batch_size=args.micro_batch_size
+            )
 
-                losses.append(loss)
+            trainer.update(unet_number=i + 1)
+
+            losses.append(loss)
 
             t2 = time.monotonic()
             rate.append(round(1.0 / (t2 - t1), 2))
@@ -341,47 +377,14 @@ def train(args):
                       round(np.mean(rate), 2)))
 
             if step % 1000 == 0:
-                if poses is not None and sample_poses is None:
-                    sample_poses = poses[:disp_size]
-
-                sample_images = trainer.sample(texts=sample_texts,
-                                               cond_images=sample_poses,
-                                               cond_scale=7.,
-                                               return_all_unet_outputs=True)
-
-                sample_images0 = transforms.Resize(args.size)(sample_images[0])
-                sample_images1 = transforms.Resize(args.size)(sample_images[-1])
-                sample_images = torch.cat([sample_images0, sample_images1])
-
-                if poses is not None:
-                    sample_poses0 = transforms.Resize(args.size)(sample_poses)
-                    sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
-
-                grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
-                VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
+                make_training_samples(poses, trainer, args, epoch, step)
 
                 if args.imagen is not None:
                     trainer.save(args.imagen, unet1_dims=args.unet_dims,
-                                 unet2_dims=args.unet2_dims)
+                                 unet2_dims=args.unet2_dims)    
 
-        if poses is not None and sample_poses is None:
-            sample_poses = poses[:disp_size]
-
-        sample_images = trainer.sample(texts=sample_texts,
-                                       cond_images=sample_poses,
-                                       cond_scale=7.,
-                                       return_all_unet_outputs=True)
-
-        sample_images0 = transforms.Resize(args.size)(sample_images[0])
-        sample_images1 = transforms.Resize(args.size)(sample_images[-1])
-        sample_images = torch.cat([sample_images0, sample_images1])
-
-        if poses is not None:
-            sample_poses0 = transforms.Resize(args.size)(sample_poses)
-            sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
-
-        grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
-        VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}.png"))
+        # END OF EPOCH
+        make_training_samples(poses, trainer, args, epoch, step)
 
         if args.imagen is not None:
             trainer.save(args.imagen, unet1_dims=args.unet_dims,

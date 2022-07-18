@@ -102,8 +102,7 @@ def get_images(txt_out, img_out, tags, num=1000, start_id=0, no_animated=False, 
                 tags = ", ".join(tags)
             f.write(tags)
 
-        if not no_animated and ("animated" in tags or
-            is_video(url)):
+        if not no_animated and ("animated" in tags or is_video(url)):
             frames = split_animation(url, img_id, img_out, fps)
 
             count += len(frames)
@@ -113,7 +112,7 @@ def get_images(txt_out, img_out, tags, num=1000, start_id=0, no_animated=False, 
                 bn = bn.replace("png", "txt")
                 shutil.copy2(txt_out_tmp, os.path.join(txt_out, bn))
 
-        else:
+        elif not is_video(url):
             try:
                 urlretrieve(url, img_out_tmp)
                 # Verify the image is actually an image...
@@ -156,9 +155,10 @@ def main():
 
     jobs = [(args.txt_out, args.img_out, tags)]
 
-    if args.url is not None:
-        GelbooruViewer.API_URL = args.url
-    else:
+    GelbooruViewer.API_URL = args.url
+    if args.url == "realbooru":
+        GelbooruViewer.API_URL = "https://realbooru.com/index.php?page=dapi&s=post&q=index"
+    elif args.url is None:
         GelbooruViewer.API_URL = "https://rule34.xxx/index.php?page=dapi&s=post&q=index"
 
     if args.update_artists:
