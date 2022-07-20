@@ -64,7 +64,7 @@ def main():
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
     parser.add_argument('--size', default=256, type=int)
-    parser.add_argument('--sample_steps', default=None, type=int)
+    parser.add_argument('--sample_steps', default=13, type=int)
     parser.add_argument('--num_unets', default=1, type=int, help="additional unet networks")
     parser.add_argument('--vocab_limit', default=None, type=int)
     parser.add_argument('--epochs', default=100, type=int)
@@ -73,6 +73,7 @@ def main():
     parser.add_argument('--replace', action='store_true', help="replace the output file")
     parser.add_argument('--unet_dims', default=128, type=int)
     parser.add_argument('--unet2_dims', default=64, type=int)
+    parser.add_argument("--start_size", default=64, type=int)
 
     # training
     parser.add_argument('--batch_size', default=8, type=int)
@@ -80,8 +81,10 @@ def main():
     parser.add_argument('--samples_out', default="samples")
     parser.add_argument('--train', action='store_true')
     parser.add_argument('--shuffle_tags', action='store_true')
-    parser.add_argument('--train_unet', type=int, default=0)
+    parser.add_argument('--train_unet', type=int, default=1)
     parser.add_argument('--random_drop_tags', type=float, default=0.)
+    parser.add_argument('--fp16', action='store_true')
+    parser.add_argument('--workers', type=int, default=8)
 
     args = parser.parse_args()
 
@@ -107,7 +110,7 @@ def sample(args):
         return
 
     try:
-        imagen = load(args, args.imagen)
+        imagen = load(args.imagen)
     except:
         print(f"Error loading model: {args.imagen}")
         return
@@ -154,7 +157,7 @@ def save(imagen, path):
     torch.save(out, path)
 
 
-def load(args, path):
+def load(path):
 
     imagen = load_imagen_from_checkpoint(path)
 
@@ -195,17 +198,17 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             dim_mults=(1, 2, 3, 4),
             cond_images_channels=cond_images_channels,
             num_resnet_blocks=3,
-            layer_attns=(False, False, False, False),
+            layer_attns=(False, False, False, True),
             layer_cross_attns=(False, False, False, True),
             final_conv_kernel_size=1,
-            memory_efficient=False
+            memory_efficient=True
         )
 
         unets.append(unet2)
 
-    image_sizes = []
+    image_sizes = [args.start_size]
 
-    for i in range(len(unets)-1):
+    for i in range(1, len(unets)-1):
         image_sizes.append(int(math.pow(2, 6 + i)))
 
     image_sizes.append(args.size)
@@ -263,6 +266,7 @@ def make_training_samples(poses, trainer, args, epoch, step):
         sample_images = final_samples
     else:
         sample_images = sample_images[0]
+        sample_images = transforms.Resize(args.size)(sample_images)
 
     if poses is not None:
         sample_poses0 = transforms.Resize(args.size)(sample_poses)
@@ -276,11 +280,11 @@ def train(args):
 
     imagen = get_imagen(args)
 
+    trainer = ImagenTrainer(imagen, fp16=args.fp16)
+    
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
-        imagen = load_imagen_from_checkpoint(args.imagen)
-
-    trainer = ImagenTrainer(imagen)
+        trainer.load(args.imagen)
 
     print("Fetching image indexes...")
 
@@ -330,7 +334,8 @@ def train(args):
     dl = torch.utils.data.DataLoader(data,
                                      batch_size=args.batch_size,
                                      shuffle=True,
-                                     num_workers=8)
+                                     num_workers=args.workers,
+                                     pin_memory=True)
     
     rate = deque([1], maxlen=5)
 
@@ -350,17 +355,16 @@ def train(args):
 
             t1 = time.monotonic()
             losses = []
-            i = args.train_unet
 
             loss = trainer(
                 images,
                 cond_images=poses,
                 texts=texts,
-                unet_number=i + 1,
+                unet_number=args.train_unet,
                 max_batch_size=args.micro_batch_size
             )
 
-            trainer.update(unet_number=i + 1)
+            trainer.update(unet_number=args.train_unet)
 
             losses.append(loss)
 
@@ -376,7 +380,7 @@ def train(args):
                       round(np.sum(losses), 5),
                       round(np.mean(rate), 2)))
 
-            if step % 1000 == 0:
+            if step % 1 == 0:
                 make_training_samples(poses, trainer, args, epoch, step)
 
                 if args.imagen is not None:
