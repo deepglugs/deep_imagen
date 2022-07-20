@@ -68,7 +68,7 @@ def get_images(txt_out, img_out, tags, num=1000, start_id=0, no_animated=False, 
         from pybooru import Danbooru
 
         client = Danbooru('danbooru')
-        pictures = client.post_list(tags=tags, limit=1000)
+        pictures = client.post_list(tags=tags, limit=num)
 
         if pictures is None:
             print(f"no images for tags: {tags}")
