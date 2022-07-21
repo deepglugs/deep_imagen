@@ -85,6 +85,7 @@ def main():
     parser.add_argument('--random_drop_tags', type=float, default=0.)
     parser.add_argument('--fp16', action='store_true')
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--no_text_transform', action='store_true')
 
     args = parser.parse_args()
 
@@ -322,11 +323,16 @@ def train(args):
 
         return txt
 
+    tag_transform = txt_xforms
+
+    if args.no_text_transform:
+        tag_transform = None
+
     data = ImageLabelDataset(imgs, txts, None,
                              poses=poses,
                              dim=(args.size, args.size),
                              transform=tforms,
-                             tag_transform=txt_xforms,
+                             tag_transform=tag_transform,
                              channels_first=True,
                              return_raw_txt=True,
                              no_preload=True)
@@ -334,8 +340,7 @@ def train(args):
     dl = torch.utils.data.DataLoader(data,
                                      batch_size=args.batch_size,
                                      shuffle=True,
-                                     num_workers=args.workers,
-                                     pin_memory=True)
+                                     num_workers=args.workers)
     
     rate = deque([1], maxlen=5)
 
@@ -371,7 +376,7 @@ def train(args):
             t2 = time.monotonic()
             rate.append(round(1.0 / (t2 - t1), 2))
 
-            if step % 100 == 0:
+            if step % 10 == 0:
                 print("epoch {}/{} step {}/{} loss: {} - {}it/s".format(
                       epoch,
                       args.epochs,
@@ -380,19 +385,17 @@ def train(args):
                       round(np.sum(losses), 5),
                       round(np.mean(rate), 2)))
 
-            if step % 1 == 0:
+            if step % 100 == 0:
                 make_training_samples(poses, trainer, args, epoch, step)
 
                 if args.imagen is not None:
-                    trainer.save(args.imagen, unet1_dims=args.unet_dims,
-                                 unet2_dims=args.unet2_dims)    
+                    trainer.save(args.imagen)    
 
         # END OF EPOCH
         make_training_samples(poses, trainer, args, epoch, step)
 
         if args.imagen is not None:
-            trainer.save(args.imagen, unet1_dims=args.unet_dims,
-                         unet2_dims=args.unet2_dims)
+            trainer.save(args.imagen)
 
 
 if __name__ == "__main__":
