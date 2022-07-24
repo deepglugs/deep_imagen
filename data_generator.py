@@ -469,7 +469,10 @@ class ImageLabelDataset():
 
         if muh_oh is None:
             self._preload_txts(images=[img])
-            muh_oh = self.txts_oh[bn]
+            try:
+                muh_oh = self.txts_oh[bn]
+            except KeyError:
+                os.remove(img)
 
         y = muh_oh
         # print(txt_from_onehot(self.vocab, self.txts_oh[bn]))

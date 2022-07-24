@@ -64,7 +64,7 @@ def main():
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
     parser.add_argument('--size', default=256, type=int)
-    parser.add_argument('--sample_steps', default=13, type=int)
+    parser.add_argument('--sample_steps', default=32, type=int)
     parser.add_argument('--num_unets', default=1, type=int, help="additional unet networks")
     parser.add_argument('--vocab_limit', default=None, type=int)
     parser.add_argument('--epochs', default=100, type=int)
@@ -86,6 +86,7 @@ def main():
     parser.add_argument('--fp16', action='store_true')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--no_text_transform', action='store_true')
+    parser.add_argument('--aug', action='store_true', help="additional image augmentations")
 
     args = parser.parse_args()
 
@@ -196,11 +197,11 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
         unet2 = dict(
             dim=unet2_dims // (i + 1),
             cond_dim=512,
-            dim_mults=(1, 2, 3, 4),
+            dim_mults=(1, 2, 3, 6),
             cond_images_channels=cond_images_channels,
-            num_resnet_blocks=3,
+            num_resnet_blocks=(2, 4, 8, 8),
             layer_attns=(False, False, False, True),
-            layer_cross_attns=(False, False, False, True),
+            layer_cross_attns=(False, False, True, True),
             final_conv_kernel_size=1,
             memory_efficient=True
         )
@@ -209,10 +210,8 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
     image_sizes = [args.start_size]
 
-    for i in range(1, len(unets)-1):
-        image_sizes.append(int(math.pow(2, 6 + i)))
-
-    image_sizes.append(args.size)
+    for i in range(0, len(unets)-1):
+        image_sizes.append(image_sizes[-1] * 4)
 
     print(f"image_sizes={image_sizes}")
 
@@ -251,7 +250,8 @@ def make_training_samples(poses, trainer, args, epoch, step):
     sample_images = trainer.sample(texts=sample_texts,
                                    cond_images=sample_poses,
                                    cond_scale=7.,
-                                   return_all_unet_outputs=True)
+                                   return_all_unet_outputs=True,
+                                   stop_at_unet_number=args.train_unet)
 
     final_samples = None
 
@@ -264,6 +264,7 @@ def make_training_samples(poses, trainer, args, epoch, step):
 
             sample_images1 = transforms.Resize(args.size)(si)
             final_samples = torch.cat([final_samples, sample_images1])
+        
         sample_images = final_samples
     else:
         sample_images = sample_images[0]
@@ -304,6 +305,15 @@ def train(args):
             PadImage(),
             transforms.Resize((args.size, args.size)),
             transforms.ToTensor()])
+
+    if args.aug:
+        tforms = transforms.Compose([
+            PadImage(),
+            transforms.RandomCrop(args.size),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(degrees=(0, 180)),
+            transforms.ToTensor()])
+
 
     def txt_xforms(txt):
         # print(f"txt: {txt}")
