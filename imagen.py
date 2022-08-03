@@ -326,7 +326,7 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
 
             sample_images1 = transforms.Resize(args.size)(si)
             final_samples = torch.cat([final_samples, sample_images1])
-        
+
         sample_images = final_samples
     else:
         sample_images = sample_images[0]
@@ -337,15 +337,22 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
         sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
 
     grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
-    VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}_loss{round(epoch_loss / step, 5)}.png"))
+    VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}_loss{epoch_loss}.png"))
 
 
 def train(args):
 
     imagen = get_imagen(args)
 
+    precision = None
+
+    if args.fp16:
+        precision = "fp16"
+    elif args.bf16:
+        precision = "bf16"
+
     trainer = ImagenTrainer(imagen, fp16=args.fp16)
-    
+
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
         trainer.load(args.imagen)
@@ -354,7 +361,7 @@ def train(args):
 
     imgs = get_images(args.source, verify=False)
     txts = get_images(args.tags_source, exts=".txt")
-    
+
     print(f"{len(imgs)} images")
     print(f"{len(txts)} tags")
 
@@ -418,17 +425,12 @@ def train(args):
                                      batch_size=args.batch_size,
                                      shuffle=True,
                                      num_workers=args.workers)
-    
+
     rate = deque([1], maxlen=5)
 
     os.makedirs(args.samples_out, exist_ok=True)
 
     print(f"training on {len(data)} images")
-
-    train_dtype = torch.float16
-
-    if args.bf16:
-        train_dtype = torch.bfloat16
 
     for epoch in range(args.start_epoch, args.epochs + 1):
         step = 0
@@ -444,43 +446,33 @@ def train(args):
 
                 step += 1
 
-                t1 = time.monotonic()
-                losses = []
-                with torch.cuda.amp.autocast(enabled=args.bf16, dtype=train_dtype):
-                    loss = trainer(
-                        images,
-                        cond_images=cond_images,
-                        texts=texts,
-                        unet_number=args.train_unet,
-                        max_batch_size=args.micro_batch_size
-                    )
+                loss = trainer(
+                    images,
+                    cond_images=cond_images,
+                    texts=texts,
+                    unet_number=args.train_unet,
+                    max_batch_size=args.micro_batch_size
+                )
 
-                    trainer.update(unet_number=args.train_unet)
-
-                t2 = time.monotonic()
-                rate.append(round(1.0 / (t2 - t1), 2))
+                trainer.update(unet_number=args.train_unet)
 
                 epoch_loss += loss
-                tepoch.set_postfix(loss=round(loss, 5), epoch_loss=round(epoch_loss / step, 5))
+                epoch_loss_disp = round(float(epoch_loss) / float(step), 5)
 
-                # if step % 10 == 0:
-                #     print("epoch {}/{} step {}/{} loss: {} - {}it/s".format(
-                #           epoch,
-                #           args.epochs,
-                #           step * args.batch_size,
-                #           len(imgs),
-                #           round(np.sum(losses), 5),
-                #           round(np.mean(rate), 2)))
+                tepoch.set_description(f"Epoch {epoch}")
+                tepoch.set_postfix(loss=round(loss, 5), epoch_loss=epoch_loss_disp)
 
                 if step % 100 == 0:
                     make_training_samples(cond_images, trainer, args, epoch,
-                                          step, epoch_loss)
+                                          trainer.num_steps_taken(args.train_unet),
+                                          epoch_loss_disp)
 
                     if args.imagen is not None:
                         trainer.save(args.imagen)
         # END OF EPOCH
-        make_training_samples(cond_images, trainer, args, epoch, step,
-                              epoch_loss)
+        make_training_samples(cond_images, trainer, args, epoch,
+                              trainer.num_steps_taken(args.train_unet),
+                              epoch_loss_disp)
 
         if args.imagen is not None:
             trainer.save(args.imagen)
@@ -508,44 +500,77 @@ class LineByLineTextDataset(Dataset):
         return self.examples[i]
 
 
+def train_tokenizer(args):
+    import io
+    import sentencepiece as spm
+
+    if args.vocab is None:
+        args.vocab = args.tags_source
+
+    os.makedirs(args.text_encoder, exist_ok=True)
+
+    print("Fetching vocab...")
+
+    vocab = get_vocab(args.vocab, top=74270)
+
+    vocab_file = os.path.join(args.text_encoder, "t5_vocab_input.vocab")
+
+    with open(vocab_file, 'w') as f:
+        f.write("\n".join(vocab))
+
+    print(f"vocab size: {len(vocab)}")
+    print("training tokenizer...")
+    model = io.BytesIO()
+    spm.SentencePieceTrainer.train(input=vocab_file,
+                                   model_writer=model, vocab_size=len(vocab))
+
+    output_file = os.path.join(args.text_encoder, "t5_model.spm")
+
+    with open(output_file, 'wb') as f:
+        f.write(model.getvalue())
+
+    return output_file
+
+
 def train_encoder(args):
 
     from transformers import T5ForConditionalGeneration, TrainingArguments, Trainer
     from transformers import DataCollatorForLanguageModeling
     from transformers import T5Tokenizer
 
+    assert args.text_encoder is not None
+
     pretrained = "t5-small"
 
-    if os.path.exists(args.output):
-        pretrained = args.output
+    if os.path.exists(args.text_encoder):
+        pretrained = args.text_encoder
 
     model = T5ForConditionalGeneration.from_pretrained(pretrained)
-    orig_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+
+    t5_spm_model = train_tokenizer(args)
+
+    tokenizer = T5Tokenizer(t5_spm_model)
 
     txts = get_images(args.tags_source, exts=".txt")
-
-    # tok_dataset = LineByLineTextDataset(None, txts)
-
-    # tokenizer = orig_tokenizer.train_new_from_iterator(tok_dataset, 52000)
-    tokenizer = orig_tokenizer
-    tokenizer.save_pretrained(args.output)
+    tokenizer.save_pretrained(args.text_encoder)
 
     tokenizer.pad_token = tokenizer.eos_token
 
     lm_dataset = LineByLineTextDataset(tokenizer, txts)
     val_dataset = LineByLineTextDataset(tokenizer, txts[-2:])
-    
+
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     training_args = TrainingArguments(
-                                      output_dir=args.output,
+                                      output_dir=args.text_encoder,
                                       evaluation_strategy="epoch",
                                       learning_rate=2e-5,
                                       weight_decay=0.01,
                                       num_train_epochs=args.epochs,
                                       auto_find_batch_size=True,
                                       save_strategy="epoch",
-                                      save_total_limit=3
+                                      save_total_limit=3,
+                                      bf16=args.bf16
                                      )
 
     trainer = Trainer(
@@ -557,6 +582,7 @@ def train_encoder(args):
                      )
 
     trainer.train()
+    trainer.save_model(args.text_encoder)
 
 
 if __name__ == "__main__":

@@ -59,7 +59,7 @@ def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
 
     vocab = []
     occ = {}
-    print(filter_tags)
+
     files = get_images(txt_dir_path, exts=['.txt'])
     for file in files:
         with open(file, "r") as f:
