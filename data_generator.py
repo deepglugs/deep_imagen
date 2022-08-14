@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import PIL
+import sys
+
 from PIL import Image
 
 from gan_utils import txt_to_onehot, \
@@ -21,7 +23,8 @@ class DataGenerator():
                  as_array=False,
                  resize=False,
                  limit=None,
-                 return_raw_txt=False):
+                 return_raw_txt=False,
+                 use_text_encodings=False):
 
         self.images = images
         self.txts = txts
@@ -38,6 +41,7 @@ class DataGenerator():
         self.resize = resize
         self.limit = limit
         self.return_raw_txt = return_raw_txt
+        self.use_text_encodings = use_text_encodings
         self.on_epoch_end()
 
 
@@ -66,10 +70,7 @@ class DataGenerator():
         txts = {}
 
         for txt in self.txts:
-            bn = os.path.basename(txt)
-
-            bn = bn.replace('.txt', '')
-
+            bn = os.path.splitext(os.path.basename(txt))[0]
             txts[bn] = txt
 
         for img in self.images:
@@ -82,16 +83,25 @@ class DataGenerator():
             try:
                 txt = txts[bn]
 
-                with open(txt, 'r') as f:
-                    txt_data = f.read()
-
-                if self.tag_transform is not None:
-                    txt_data = self.tag_transform(txt_data)
-
-                if not self.return_raw_txt:
-                    oh = txt_to_onehot(self.vocab, txt_data)
+                if self.use_text_encodings:
+                    oh = np.load(txt)
                 else:
-                    oh = txt_data
+                    with open(txt, 'r') as f:
+                        try:
+                            txt_data = f.read()
+                        except Exception as ex:
+                            print(ex)
+                            print(f"with file {txt}")
+
+                            txt_data = ""
+
+                    if self.tag_transform is not None:
+                        txt_data = self.tag_transform(txt_data)
+
+                    if not self.return_raw_txt:
+                        oh = txt_to_onehot(self.vocab, txt_data)
+                    else:
+                        oh = txt_data
 
                 self.txts_oh[bn] = oh
 
@@ -233,7 +243,8 @@ class ImageLabelDataset():
                  resize=False,
                  limit=None,
                  return_raw_txt=False,
-                 no_preload=False):
+                 no_preload=False,
+                 use_text_encodings=False):
 
         self.images = images
         self.txts = txts
@@ -252,6 +263,7 @@ class ImageLabelDataset():
         self.resize = resize
         self.limit = limit
         self.return_raw_txt = return_raw_txt
+        self.use_text_encodings = use_text_encodings
         self.on_epoch_end()
 
         self.transform = transform
@@ -286,10 +298,7 @@ class ImageLabelDataset():
         txts = {}
 
         for txt in self.txts:
-            bn = os.path.basename(txt)
-
-            bn = bn.replace('.txt', '')
-
+            bn = os.path.splitext(os.path.basename(txt))[0]
             txts[bn] = txt
 
         for img in images:
@@ -301,17 +310,25 @@ class ImageLabelDataset():
 
             try:
                 txt = txts[bn]
-
-                with open(txt, 'r') as f:
-                    txt_data = f.read()
-
-                if self.tag_transform is not None:
-                    txt_data = self.tag_transform(txt_data)
-
-                if not self.return_raw_txt:
-                    oh = txt_to_onehot(self.vocab, txt_data)
+                if self.use_text_encodings:
+                    oh = np.load(txt)
                 else:
-                    oh = txt_data
+                    with open(txt, 'r', encoding="utf-8") as f:
+                        try:
+                            txt_data = f.read()
+                        except Exception as ex:
+                            print(ex)
+                            print(f"Error reading text file: {txt}")
+
+                            txt_data = ""
+
+                    if self.tag_transform is not None:
+                        txt_data = self.tag_transform(txt_data)
+
+                    if not self.return_raw_txt:
+                        oh = txt_to_onehot(self.vocab, txt_data)
+                    else:
+                        oh = txt_data
 
                 self.txts_oh[bn] = oh
 

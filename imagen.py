@@ -1,13 +1,17 @@
+#!/usr/bin/env python3
+
 import math
 import numbers
 import os
 import random
 import re
+import sys
 import time
 from collections import deque
 
 import numpy as np
 import torch
+from functools import reduce
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import functional as VTF
@@ -19,6 +23,10 @@ from imagen_pytorch import ImagenTrainer, ElucidatedImagenConfig, ImagenConfig
 from imagen_pytorch import load_imagen_from_checkpoint
 from gan_utils import get_images, get_vocab
 from data_generator import ImageLabelDataset
+
+
+def safeget(dictionary, keys, default = None):
+    return reduce(lambda d, key: d.get(key, default) if isinstance(d, dict) else default, keys.split('.'), dictionary)
 
 
 def get_padding(image):    
@@ -57,6 +65,12 @@ class PadImage(object):
             format(self.fill, self.padding_mode)
 
 
+def tuple_type(strings):
+    strings = strings.replace("(", "").replace(")", "")
+    mapped_int = map(int, strings.split(","))
+    return tuple(mapped_int)
+
+
 def main():
     import argparse
 
@@ -64,10 +78,11 @@ def main():
     parser.add_argument('--source', type=str, default=None, help="image source")
     parser.add_argument('--tags_source', type=str, default=None, help="tag files. will use --source if not specified.")
     parser.add_argument('--cond_images', type=str, default=None)
+    parser.add_argument('--embeddings', type=str, default=None)
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
     parser.add_argument('--size', default=256, type=int)
-    parser.add_argument('--sample_steps', default=32, type=int)
+    parser.add_argument('--sample_steps', default=256, type=int)
     parser.add_argument('--num_unets', default=1, type=int, help="additional unet networks")
     parser.add_argument('--vocab_limit', default=None, type=int)
     parser.add_argument('--epochs', default=100, type=int)
@@ -76,12 +91,25 @@ def main():
     parser.add_argument('--replace', action='store_true', help="replace the output file")
     parser.add_argument('--unet_dims', default=128, type=int)
     parser.add_argument('--unet2_dims', default=64, type=int)
+    parser.add_argument('--dim_mults', default="(1,2,3,4)", type=tuple_type)
     parser.add_argument("--start_size", default=64, type=int)
     parser.add_argument("--sample_unet", default=None, type=int)
     parser.add_argument('--device', type=str, default="cuda")
     parser.add_argument('--text_encoder', type=str, default="t5-large")
-    parser.add_argument("--cond_scale", default=10, type=float, help="sampling conditional scale 0-10.0")
+    parser.add_argument("--cond_scale", default=0.7, type=float, help="sampling conditional scale 0-10.0")
     parser.add_argument('--no_elu', action='store_true', help="don't use elucidated imagen")
+    parser.add_argument("--num_samples", default=1, type=int)
+    parser.add_argument("--init_image", default=None,)
+    parser.add_argument("--skip_steps", default=None, type=int)
+    parser.add_argument("--sigma_max", default=80, type=float)
+    parser.add_argument("--full_load", action="store_true",
+                        help="don't use load_from_checkpoint.")
+    parser.add_argument('--no_memory_efficient', action='store_true',
+                        help="don't use memory_efficient unet1")
+    parser.add_argument('--print_params', action='store_true',
+                        help="print model params and exit")
+    parser.add_argument("--unet_size_mult", default=4, type=int)
+
 
     # training
     parser.add_argument('--batch_size', default=8, type=int)
@@ -97,6 +125,10 @@ def main():
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--no_text_transform', action='store_true')
     parser.add_argument('--start_epoch', default=1, type=int)
+    parser.add_argument('--no_patching', action='store_true')
+    parser.add_argument('--create_embeddings', action='store_true')
+    parser.add_argument('--verify_images', action='store_true')
+    parser.add_argument('--pretrained', default="t5-small")
 
     args = parser.parse_args()
 
@@ -109,11 +141,18 @@ def main():
     if args.vocab is None:
         args.vocab = args.source
     else:
-        assert os.path.isfile(args.vocab)
+        assert os.path.isfile(args.vocab) or os.path.isdir(args.vocab)
 
     if args.bf16:
         # probably (maybe) need to set TORCH_CUDNN_V8_API_ENABLED=1 in environment
         torch.set_float32_matmul_precision("medium")
+
+    if args.print_params:
+        print_model_params(args)
+        sys.exit()
+
+    if args.create_embeddings:
+        create_embeddings(args)
 
     if args.train_encoder:
         train_encoder(args)
@@ -123,15 +162,17 @@ def main():
     else:
         sample(args)
 
+
 def sample(args):
 
     if os.path.isfile(args.output) and not args.replace:
         return
 
     try:
-        imagen = load(args.imagen).to(args.device)
-    except:
+        imagen = load(args).to(args.device)
+    except Exception as ex:
         print(f"Error loading model: {args.imagen}")
+        print(ex)
         return
 
     args.num_unets = len(imagen.unets) - 1
@@ -151,14 +192,49 @@ def sample(args):
         cond_image = tforms(cond_image).to(imagen.device)
         cond_image = cond_image.view(1, *cond_image.shape)
 
-    sample_images = imagen.sample(texts=[args.tags],
+    init_image = None
+
+    if args.init_image is not None:
+        tforms = transforms.Compose([PadImage(),
+                                     transforms.Resize((args.size, args.size)),
+                                     transforms.ToTensor()])
+        init_image = Image.open(args.init_image)
+        init_image = tforms(init_image).to(imagen.device)
+        init_image = init_image.view(1, *init_image.shape)
+
+    text_embeds = None
+    sample_texts = args.tags
+    if args.embeddings is not None:
+        sample_texts = args.embeddings
+        text_embeds = get_text_embeddings(sample_texts, text_encoder=args.text_encoder)
+        text_embeds = torch.from_numpy(text_embeds)
+        text_embeds = torch.tile(text_embeds, (args.num_samples, 1))
+        text_embeds = torch.unsqueeze(text_embeds, 1).to(args.device)
+        sample_texts = None
+    else:
+        sample_texts = list(np.repeat(sample_texts, args.num_samples))
+
+
+
+    sample_images = imagen.sample(texts=sample_texts,
+                                  text_embeds=text_embeds,
                                   cond_images=cond_image,
                                   cond_scale=args.cond_scale,
+                                  init_images=init_image,
+                                  skip_steps=args.skip_steps,
+                                  sigma_max=args.sigma_max,
                                   return_pil_images=True,
                                   stop_at_unet_number=args.sample_unet)
 
-    final_image = sample_images[-1]
-    final_image.resize((args.size, args.size)).save(args.output)
+    for i, sample in enumerate(sample_images):
+        final_image = sample
+        bn, ext = os.path.splitext(args.output)
+        output_file = bn + f"_{i}" + ext
+
+        if args.num_samples == 1:
+            output_file = args.output
+
+        final_image.resize((args.size, args.size)).save(output_file)
 
 
 def restore_parts(state_dict_target, state_dict_from):
@@ -187,9 +263,23 @@ def save(imagen, path):
     torch.save(out, path)
 
 
-def load(path):
+def print_model_params(args):
+    loaded = torch.load(args.imagen, map_location="cpu")
+    imagen_params = safeget(loaded, 'imagen_params')
 
-    imagen = load_imagen_from_checkpoint(path)
+    print(imagen_params)
+
+
+def load(args):
+
+    if not args.full_load:
+        imagen = load_imagen_from_checkpoint(args.imagen)
+
+    else:
+        model = torch.load(args.imagen, map_location="cpu")["model"]
+
+        imagen = get_imagen(args)
+        imagen.load_state_dict(model)
 
     return imagen
 
@@ -198,12 +288,12 @@ def get_image_sizes(args):
     image_sizes = [args.start_size]
 
     for i in range(0, args.num_unets):
-        ns = image_sizes[-1] * 4
-        if args.train:
-            ns = ns // 4
+        ns = image_sizes[-1] * args.unet_size_mult
+        if args.train and not args.no_patching:
+            ns = ns // args.unet_size_mult
         image_sizes.append(ns)
 
-    image_sizes[-1] = args.size // 4 if args.train else args.size
+    image_sizes[-1] = args.size // args.unet_size_mult if args.train and not args.no_patching else args.size
 
     return image_sizes
 
@@ -225,11 +315,13 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
     unet1 = dict(
         dim=unet_dims,
         cond_dim=512,
-        dim_mults=(1, 2, 4, 6),
+        dim_mults=args.dim_mults,
         cond_images_channels=cond_images_channels,
-        num_resnet_blocks=3,
+        num_resnet_blocks=2,
         layer_attns=(False, True, True, True),
-        memory_efficient=True
+        layer_cross_attns=(False, True, True, True),
+        use_global_context_attn=False,
+        memory_efficient=not args.no_memory_efficient
     )
 
     unets = [unet1]
@@ -239,12 +331,12 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
         unet2 = dict(
             dim=unet2_dims // (i + 1),
             cond_dim=512,
-            dim_mults=(1, 2, 4, 4),
+            dim_mults=(1, 2, 3, 4),
             cond_images_channels=cond_images_channels,
-            num_resnet_blocks=(2, 4, 8, 8),
+            num_resnet_blocks=2,
             layer_attns=(False, False, False, i < 2),
             layer_cross_attns=(False, False, True, True),
-            final_conv_kernel_size=1,
+            # final_conv_kernel_size=1,
             memory_efficient=True
         )
 
@@ -254,18 +346,19 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
     print(f"image_sizes={image_sizes}")
 
-    sample_steps = [args.sample_steps] * (args.num_unets + 1)
+    sample_steps = args.sample_steps # [args.sample_steps] * (args.num_unets + 1)
 
     if not args.no_elu:
         imagen = ElucidatedImagenConfig(
             unets=unets,
             text_encoder_name=args.text_encoder,
             num_sample_steps=sample_steps,
-            # noise_schedules=["cosine", "cosine"],
+            lowres_noise_schedule="cosine",
             # pred_objectives=["noise", "x_start"],
             image_sizes=image_sizes,
             per_sample_random_aug_noise_level=True,
-            lowres_sample_noise_level=0.3
+            sigma_max = args.sigma_max,
+            cond_drop_prob=0.1
         ).create().to(args.device)
 
     else:
@@ -283,10 +376,10 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
 
 def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
-    sample_texts = ['1girl, red_bikini, bikini, outdoors, pool, brown_hair',
+    sample_texts = ['1girl, red_bikini, bikini, swimsuit, outdoors, pool, brown_hair',
                     '1girl, blue_dress, eyes_closed, blonde_hair',
                     '1boy, black_hair',
-                    '1girl, wristwatch, blue_hair']
+                    '1girl, wristwatch, red_hair']
 
     disp_size = min(args.batch_size, 4)
     sample_poses = None
@@ -306,7 +399,15 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
 
     trainer.imagen.image_sizes = sample_image_sizes
 
+    text_embeds = None
+    if args.embeddings is not None:
+        text_embeds = get_text_embeddings(sample_texts, text_encoder=args.text_encoder)
+        text_embeds = torch.from_numpy(text_embeds)
+        text_embeds = torch.unsqueeze(text_embeds, 1)
+        sample_texts = None
+
     sample_images = trainer.sample(texts=sample_texts,
+                                   text_embeds=text_embeds,
                                    cond_images=sample_poses,
                                    cond_scale=args.cond_scale,
                                    return_all_unet_outputs=True,
@@ -355,12 +456,16 @@ def train(args):
 
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
-        trainer.load(args.imagen)
+        trainer.load(args.imagen, only_model=args.full_load) 
 
-    print("Fetching image indexes...")
+    print(f"Fetching image indexes in {args.source}...")
 
-    imgs = get_images(args.source, verify=False)
-    txts = get_images(args.tags_source, exts=".txt")
+    imgs = get_images(args.source, verify=args.verify_images)
+
+    if args.embeddings is not None:
+        txts = get_images(args.embeddings, exts=".npy")
+    else:
+        txts = get_images(args.tags_source, exts=".txt")
 
     print(f"{len(imgs)} images")
     print(f"{len(txts)} tags")
@@ -378,14 +483,14 @@ def train(args):
 
     tforms = transforms.Compose([
             PadImage(),
-            transforms.Resize(train_img_size),
+            transforms.Resize(train_img_size, interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.ToTensor()])
 
-    if args.train_unet > 1:
+    if args.train_unet > 1 and not args.no_patching:
         tforms = transforms.Compose([
-            transforms.Resize(args.size),
+            transforms.Resize(args.size, interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.RandomCrop(train_img_size),
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor()])
 
 
@@ -419,7 +524,8 @@ def train(args):
                              tag_transform=tag_transform,
                              channels_first=True,
                              return_raw_txt=True,
-                             no_preload=True)
+                             no_preload=True,
+                             use_text_encodings=args.embeddings is not None)
 
     dl = torch.utils.data.DataLoader(data,
                                      batch_size=args.batch_size,
@@ -446,13 +552,25 @@ def train(args):
 
                 step += 1
 
-                loss = trainer(
-                    images,
-                    cond_images=cond_images,
-                    texts=texts,
-                    unet_number=args.train_unet,
-                    max_batch_size=args.micro_batch_size
-                )
+                txt_embeds = None
+
+                if args.embeddings is not None:
+                    txt_embeds = texts
+                    texts = None
+
+                # print(txt_embeds.size())
+                try:
+                    loss = trainer(
+                        images,
+                        cond_images=cond_images,
+                        texts=texts,
+                        text_embeds=txt_embeds,
+                        unet_number=args.train_unet,
+                        max_batch_size=args.micro_batch_size
+                    )
+                except ValueError as ve:
+                    print(ve)
+                    print(texts)
 
                 trainer.update(unet_number=args.train_unet)
 
@@ -511,18 +629,41 @@ def train_tokenizer(args):
 
     print("Fetching vocab...")
 
-    vocab = get_vocab(args.vocab, top=74270)
+    vocab = get_vocab(args.vocab, top=args.vocab_limit)
 
-    vocab_file = os.path.join(args.text_encoder, "t5_vocab_input.vocab")
+    # save vocab
+    if not os.path.isfile(args.vocab):
+        with open(os.path.join(args.text_encoder, "vocab.txt"), 'w') as f:
+            f.write(", ".join(vocab))
+
+    vocab_file = os.path.join(args.text_encoder, "t5_vocab_input.tsv")
 
     with open(vocab_file, 'w') as f:
         f.write("\n".join(vocab))
+
+        # for i, w in enumerate(vocab):
+        #     f.write(f"{w}\t{i}\n")
 
     print(f"vocab size: {len(vocab)}")
     print("training tokenizer...")
     model = io.BytesIO()
     spm.SentencePieceTrainer.train(input=vocab_file,
-                                   model_writer=model, vocab_size=len(vocab))
+                                   input_format="text",
+                                   model_writer=model,
+                                   input_sentence_size=6000000,
+                                   max_sentence_length=16384,
+                                   max_sentencepiece_length=96,
+                                   shuffle_input_sentence=True,
+                                   split_by_unicode_script=False,
+                                   split_by_whitespace=True,
+                                   split_digits=False,
+                                   num_threads=8,
+                                   pad_id=0,
+                                   eos_id=1,
+                                   unk_id=2,
+                                   bos_id=3,
+                                   model_type='unigram',
+                                   vocab_size=len(vocab))
 
     output_file = os.path.join(args.text_encoder, "t5_model.spm")
 
@@ -540,10 +681,7 @@ def train_encoder(args):
 
     assert args.text_encoder is not None
 
-    pretrained = "t5-small"
-
-    if os.path.exists(args.text_encoder):
-        pretrained = args.text_encoder
+    pretrained = args.pretrained
 
     model = T5ForConditionalGeneration.from_pretrained(pretrained)
 
@@ -580,10 +718,84 @@ def train_encoder(args):
                       eval_dataset=val_dataset,
                       data_collator=data_collator,
                      )
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("Training cancelled by user.")
 
-    trainer.train()
+    print("saving model...")
     trainer.save_model(args.text_encoder)
 
+
+def get_text_embeddings(txts, tokenizer=None, model=None, text_encoder=None):
+    from transformers import AutoModel, AutoTokenizer
+
+    if tokenizer is None or model is None:
+        tokenizer = AutoTokenizer.from_pretrained(text_encoder)
+        model = AutoModel.from_pretrained(text_encoder)
+        tokenizer.padding_side = "right"
+        tokenizer.pad_token = tokenizer.eos_token
+
+    toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        last_hidden_state = model(**toks, output_hidden_states=True, return_dict=True).last_hidden_state
+
+    weights = torch.arange(start=1, end=last_hidden_state.shape[1] + 1).unsqueeze(-1).expand(last_hidden_state.size()).float()
+    weights = weights.to(last_hidden_state.device)
+
+    input_mask_expanded = toks["attention_mask"].unsqueeze(-1).expand(last_hidden_state.size()).float()
+
+    sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded * weights, dim=1)
+    sum_mask = torch.sum(input_mask_expanded * weights, dim=1)
+
+    embeddings = sum_embeddings / sum_mask
+    embeddings = embeddings.cpu().detach().numpy()
+
+    return embeddings
+
+def create_embeddings(args):
+    from transformers import AutoModel, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.text_encoder)
+    model = AutoModel.from_pretrained(args.text_encoder).to(args.device)
+
+    txts = get_images(args.tags_source, exts=".txt")
+
+    tokenizer.padding_side = "right"
+    tokenizer.pad_token = tokenizer.eos_token
+
+    empties = []
+
+    if args.output is not None:
+        os.makedirs(args.output, exist_ok=True)
+
+    for txt in tqdm(txts):
+
+        basepath = os.path.dirname(txt)
+        bn = os.path.splitext(os.path.basename(txt))[0]
+
+        if args.output is None:
+            out_file = os.path.join(basepath, f"{bn}.npy")
+        else:
+            out_file = os.path.join(args.output, f"{bn}.npy")
+
+        if os.path.isfile(out_file) and not args.replace:
+            continue
+
+        with open(txt, 'r') as f:
+            data = f.read()
+
+        if data == "":
+            empties.append(txt)
+            continue
+
+        embeddings = get_text_embeddings(data, tokenizer, model)
+
+        np.save(out_file, embeddings)
+
+    with open("empties.txt", 'w') as f:
+        f.write("\n".join(empties))
 
 if __name__ == "__main__":
     main()
