@@ -663,7 +663,7 @@ def train_tokenizer(args):
                                    unk_id=2,
                                    bos_id=3,
                                    model_type='unigram',
-                                   vocab_size=len(vocab))
+                                   vocab_size=len(vocab) // 2)
 
     output_file = os.path.join(args.text_encoder, "t5_model.spm")
 
