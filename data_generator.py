@@ -228,7 +228,7 @@ class DataGenerator():
 
 class ImageLabelDataset():
     def __init__(self, images, txts, vocab,
-                 poses=None,
+                 styles=None,
                  to_fit=True, 
                  dim=(256, 256),
                  n_channels=3,
@@ -249,8 +249,8 @@ class ImageLabelDataset():
         self.images = images
         self.txts = txts
         self.vocab = vocab
-        self.poses = poses
-        self.has_poses = True if poses is not None else False
+        self.styles = styles
+        self.has_style = True if style is not None else False
         self.to_fit = to_fit
         self.batch_size = 1
         self.dim = dim
@@ -279,11 +279,11 @@ class ImageLabelDataset():
         self.normalize = normalize
 
         self.txts_oh = {}
-        self.poses_preload = {}
+        self.styles_preload = {}
 
         if not no_preload:
             self._preload_txts()
-            if self.has_poses:
+            if self.has_style:
                 self._preload_poses()
 
     def _preload_txts(self, images=None):
@@ -346,7 +346,7 @@ class ImageLabelDataset():
 
         poses = {}
 
-        for pose in self.poses:
+        for pose in self.styles:
             bn = os.path.basename(pose)
 
             bn = os.path.splitext(bn)[0]
@@ -362,7 +362,7 @@ class ImageLabelDataset():
 
             try:
                 pose = poses[bn]
-                self.poses_preload[bn] = pose
+                self.styles_preload[bn] = pose
             except KeyError:
                 continue
 
@@ -496,12 +496,12 @@ class ImageLabelDataset():
 
         # print(f"loading {img}")
 
-        if self.has_poses:
-            pose = self.poses_preload.get(bn, None)
+        if self.has_style:
+            pose = self.styles_preload.get(bn, None)
 
             if pose is None:
                 self._preload_poses(images=[img])
-                pose = self.poses_preload[bn]
+                pose = self.styles_preload[bn]
 
             the_pose = Image.open(pose).convert("RGB")
             the_pose = self.transform(the_pose)

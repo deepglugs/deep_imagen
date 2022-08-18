@@ -78,6 +78,7 @@ def main():
     parser.add_argument('--source', type=str, default=None, help="image source")
     parser.add_argument('--tags_source', type=str, default=None, help="tag files. will use --source if not specified.")
     parser.add_argument('--cond_images', type=str, default=None)
+    parser.add_argument('--style', type=str, default=None)
     parser.add_argument('--embeddings', type=str, default=None)
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
@@ -129,6 +130,8 @@ def main():
     parser.add_argument('--create_embeddings', action='store_true')
     parser.add_argument('--verify_images', action='store_true')
     parser.add_argument('--pretrained', default="t5-small")
+    parser.add_argument('--no_sample', action='store_true',
+                        help="do not sample while training")
 
     args = parser.parse_args()
 
@@ -145,6 +148,9 @@ def main():
 
     if args.bf16:
         # probably (maybe) need to set TORCH_CUDNN_V8_API_ENABLED=1 in environment
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("medium")
 
     if args.print_params:
@@ -213,8 +219,6 @@ def sample(args):
         sample_texts = None
     else:
         sample_texts = list(np.repeat(sample_texts, args.num_samples))
-
-
 
     sample_images = imagen.sample(texts=sample_texts,
                                   text_embeds=text_embeds,
@@ -406,12 +410,13 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
         text_embeds = torch.unsqueeze(text_embeds, 1)
         sample_texts = None
 
-    sample_images = trainer.sample(texts=sample_texts,
-                                   text_embeds=text_embeds,
-                                   cond_images=sample_poses,
-                                   cond_scale=args.cond_scale,
-                                   return_all_unet_outputs=True,
-                                   stop_at_unet_number=args.train_unet)
+    with trainer.accelerator.autocast():
+        sample_images = trainer.sample(texts=sample_texts,
+                                       text_embeds=text_embeds,
+                                       cond_images=sample_poses,
+                                       cond_scale=args.cond_scale,
+                                       return_all_unet_outputs=True,
+                                       stop_at_unet_number=args.train_unet)
 
     # restore train image sizes:
     trainer.imagen.image_sizes = train_image_sizes
@@ -439,6 +444,11 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
 
     grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
     VTF.to_pil_image(grid).save(os.path.join(args.samples_out, f"imagen_{epoch}_{int(step / epoch)}_loss{epoch_loss}.png"))
+
+
+def delete_random_elems(input_list, n):
+    to_delete = set(random.sample(range(len(input_list)), n))
+    return [x for i,x in enumerate(input_list) if not i in to_delete]
 
 
 def train(args):
@@ -493,9 +503,9 @@ def train(args):
             # transforms.RandomHorizontalFlip(),
             transforms.ToTensor()])
 
-
     def txt_xforms(txt):
         # print(f"txt: {txt}")
+        # txt = txt.replace("_", " ")
         txt = txt.split(", ")
         if args.shuffle_tags:
             np.random.shuffle(txt)
@@ -503,10 +513,10 @@ def train(args):
         r = int(len(txt) * args.random_drop_tags)
 
         if r > 0:
-            rand_range = random.randrange(r)
+            r = random.randrange(r)
 
         if args.random_drop_tags > 0.0 and r > 0:
-            txt.pop(rand_range)
+            txt = delete_random_elems(txt, r)
 
         txt = ", ".join(txt)
 
@@ -581,16 +591,18 @@ def train(args):
                 tepoch.set_postfix(loss=round(loss, 5), epoch_loss=epoch_loss_disp)
 
                 if step % 100 == 0:
-                    make_training_samples(cond_images, trainer, args, epoch,
-                                          trainer.num_steps_taken(args.train_unet),
-                                          epoch_loss_disp)
+                    if not args.no_sample:
+                        make_training_samples(cond_images, trainer, args, epoch,
+                                              trainer.num_steps_taken(args.train_unet),
+                                              epoch_loss_disp)
 
                     if args.imagen is not None:
                         trainer.save(args.imagen)
         # END OF EPOCH
-        make_training_samples(cond_images, trainer, args, epoch,
-                              trainer.num_steps_taken(args.train_unet),
-                              epoch_loss_disp)
+        if not args.no_sample:
+            make_training_samples(cond_images, trainer, args, epoch,
+                                  trainer.num_steps_taken(args.train_unet),
+                                  epoch_loss_disp)
 
         if args.imagen is not None:
             trainer.save(args.imagen)
@@ -663,7 +675,7 @@ def train_tokenizer(args):
                                    unk_id=2,
                                    bos_id=3,
                                    model_type='unigram',
-                                   vocab_size=len(vocab))
+                                   vocab_size=len(vocab) // 2)
 
     output_file = os.path.join(args.text_encoder, "t5_model.spm")
 

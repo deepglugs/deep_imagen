@@ -50,7 +50,7 @@ async def split_animation(url, output, fps=30):
     return frame_files
 
 
-def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
+def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", ", exts=None):
     # Also supports .vocab file:
     if os.path.isfile(txt_dir_path):
         with open(txt_dir_path, 'r') as f:
@@ -60,7 +60,11 @@ def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
     vocab = []
     occ = {}
 
-    files = get_images(txt_dir_path, exts=['.txt'])
+    if exts is None:
+        exts = ['.txt', '.text', '.tag']
+
+    files = get_images(txt_dir_path, exts=exts)
+
     for file in files:
         with open(file, "r") as f:
             try:
