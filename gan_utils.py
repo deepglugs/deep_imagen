@@ -1,8 +1,10 @@
 import asyncio
 import math
 import os
-import numpy as np
+from collections import Counter
+from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 
@@ -52,13 +54,12 @@ async def split_animation(url, output, fps=30):
 
 def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
     # Also supports .vocab file:
-    if os.path.isfile(txt_dir_path):
+    if Path(txt_dir_path).is_file():
         with open(txt_dir_path, 'r') as f:
             data = f.read()
             return np.array(data.split(splitter))
 
     vocab = []
-    occ = {}
 
     files = get_images(txt_dir_path, exts=['.txt'])
     for file in files:
@@ -70,11 +71,7 @@ def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
                 for tag in tags:
 
                     tag = tag.replace("\n", "")
-
-                    if tag not in occ:
-                        occ[tag] = 0
-
-                    occ[tag] += 1
+                    tag = tag.strip()
 
                     if filter_tags is not None:
                         for filter in filter_tags:
@@ -88,6 +85,7 @@ def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
                 print(f"error processing {file}")
 
     vocab = list(set(vocab))
+    occ = Counter(vocab)
 
     if top is not None:
         new_vocab = []
