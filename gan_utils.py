@@ -71,6 +71,7 @@ def get_vocab(txt_dir_path, filter_tags=None, top=None, splitter=", "):
                 for tag in tags:
 
                     tag = tag.replace("\n", "")
+                    tag = tag.strip()
 
                     if filter_tags is not None:
                         for filter in filter_tags:
