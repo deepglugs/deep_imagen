@@ -229,11 +229,13 @@ class DataGenerator():
 class ImageLabelDataset():
     def __init__(self, images, txts, vocab,
                  styles=None,
+                 cond_images=None,
                  to_fit=True, 
                  dim=(256, 256),
                  n_channels=3,
                  shuffle=True,
                  transform=None,
+                 alt_transform=None, # transform for style and cond images
                  normalize=True,
                  ret_filenames=False,
                  channels_first=False,
@@ -250,7 +252,9 @@ class ImageLabelDataset():
         self.txts = txts
         self.vocab = vocab
         self.styles = styles
-        self.has_style = True if style is not None else False
+        self.cond_images = cond_images
+        self.has_style = True if styles is not None else False
+        self.has_cond = True if cond_images is not None else False
         self.to_fit = to_fit
         self.batch_size = 1
         self.dim = dim
@@ -267,6 +271,11 @@ class ImageLabelDataset():
         self.on_epoch_end()
 
         self.transform = transform
+        self.alt_transform = alt_transform
+
+        if self.alt_transform is None:
+            self.alt_transform = self.transform
+
         self.tag_transform = tag_transform
         self.silent = silent
 
@@ -280,11 +289,16 @@ class ImageLabelDataset():
 
         self.txts_oh = {}
         self.styles_preload = {}
+        self.cond_preload = {}
 
         if not no_preload:
             self._preload_txts()
             if self.has_style:
-                self._preload_poses()
+                self._preload_poses(dest=self.styles_preload,
+                                    source=self.styles)
+            if self.has_cond:
+                self._preload_poses(dest=self.cond_preload,
+                                    source=self.cond_images)
 
     def _preload_txts(self, images=None):
         # print("preloading txt files...")
@@ -335,7 +349,7 @@ class ImageLabelDataset():
             except KeyError:
                 continue
 
-    def _preload_poses(self, images=None):
+    def _preload_poses(self, dest, source, images=None):
         # print("preloading pose files...")
 
         if images is None:
@@ -346,7 +360,7 @@ class ImageLabelDataset():
 
         poses = {}
 
-        for pose in self.styles:
+        for pose in source:
             bn = os.path.basename(pose)
 
             bn = os.path.splitext(bn)[0]
@@ -362,7 +376,7 @@ class ImageLabelDataset():
 
             try:
                 pose = poses[bn]
-                self.styles_preload[bn] = pose
+                dest[bn] = pose
             except KeyError:
                 continue
 
@@ -496,21 +510,37 @@ class ImageLabelDataset():
 
         # print(f"loading {img}")
 
+        ret_tup = [X, y]
+
         if self.has_style:
             pose = self.styles_preload.get(bn, None)
 
             if pose is None:
-                self._preload_poses(images=[img])
+                self._preload_poses(dest=self.styles_preload, source=self.styles, images=[img])
                 pose = self.styles_preload[bn]
 
-            the_pose = Image.open(pose).convert("RGB")
-            the_pose = self.transform(the_pose)
+            the_style = Image.open(pose).convert("RGB")
+            the_style = self.alt_transform(the_style)
 
-            return X, y, the_pose
+            ret_tup.append(the_style)
+
+        if self.has_cond:
+            pose = self.cond_preload.get(bn, None)
+
+            if pose is None:
+                self._preload_poses(dest=self.cond_preload,
+                                    source=self.cond_images,
+                                    images=[img])
+                pose = self.cond_preload[bn]
+
+            the_cond = Image.open(pose).convert("RGB")
+            the_cond = self.alt_transform(the_cond)
+
+            ret_tup.append(the_cond)
 
         if self.ret_filenames:
-            return fn, X, y
+            ret_tup = [fn, *ret_tup]
 
         # print(X.size())
         # print(y.size())
-        return X, y
+        return ret_tup

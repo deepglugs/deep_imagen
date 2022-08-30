@@ -24,6 +24,11 @@ from imagen_pytorch import load_imagen_from_checkpoint
 from gan_utils import get_images, get_vocab
 from data_generator import ImageLabelDataset
 
+try:
+    import wandb
+except:
+    pass
+
 
 def safeget(dictionary, keys, default = None):
     return reduce(lambda d, key: d.get(key, default) if isinstance(d, dict) else default, keys.split('.'), dictionary)
@@ -110,7 +115,7 @@ def main():
     parser.add_argument('--print_params', action='store_true',
                         help="print model params and exit")
     parser.add_argument("--unet_size_mult", default=4, type=int)
-
+    parser.add_argument("--self_cond", action="store_true")
 
     # training
     parser.add_argument('--batch_size', default=8, type=int)
@@ -132,6 +137,11 @@ def main():
     parser.add_argument('--pretrained', default="t5-small")
     parser.add_argument('--no_sample', action='store_true',
                         help="do not sample while training")
+    parser.add_argument("--lr", default=1e-4, type=float)
+    parser.add_argument('--loss', default="l2")
+    parser.add_argument('--sample_rate', default=100, type=int)
+    parser.add_argument('--wandb', action='store_true',
+                        help="use wandb logging")
 
     args = parser.parse_args()
 
@@ -148,14 +158,18 @@ def main():
 
     if args.bf16:
         # probably (maybe) need to set TORCH_CUDNN_V8_API_ENABLED=1 in environment
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        if args.device == "cuda":
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("medium")
 
     if args.print_params:
         print_model_params(args)
         sys.exit()
+
+    if args.wandb:
+        wandb.init(project=os.path.splitext(os.path.basename(args.imagen))[0])
 
     if args.create_embeddings:
         create_embeddings(args)
@@ -196,7 +210,8 @@ def sample(args):
                                      transforms.ToTensor()])
         cond_image = Image.open(args.cond_images)
         cond_image = tforms(cond_image).to(imagen.device)
-        cond_image = cond_image.view(1, *cond_image.shape)
+        cond_image = torch.unsqueeze(cond_image, 0)
+        cond_image = cond_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
 
     init_image = None
 
@@ -206,7 +221,19 @@ def sample(args):
                                      transforms.ToTensor()])
         init_image = Image.open(args.init_image)
         init_image = tforms(init_image).to(imagen.device)
-        init_image = init_image.view(1, *init_image.shape)
+        init_image = torch.unsqueeze(init_image, 0)
+        init_image = init_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
+
+    style_image = None
+
+    if args.style is not None and os.path.isfile(args.style):
+        tforms = transforms.Compose([PadImage(),
+                                     transforms.Resize((args.size, args.size)),
+                                     transforms.ToTensor()])
+        style_image = Image.open(args.style)
+        style_image = tforms(style_image).to(imagen.device)
+        style_image = torch.unsqueeze(style_image, 0)
+        style_image = style_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
 
     text_embeds = None
     sample_texts = args.tags
@@ -223,6 +250,7 @@ def sample(args):
     sample_images = imagen.sample(texts=sample_texts,
                                   text_embeds=text_embeds,
                                   cond_images=cond_image,
+                                  styles=style_image,
                                   cond_scale=args.cond_scale,
                                   init_images=init_image,
                                   skip_steps=args.skip_steps,
@@ -325,7 +353,9 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
         layer_attns=(False, True, True, True),
         layer_cross_attns=(False, True, True, True),
         use_global_context_attn=False,
-        memory_efficient=not args.no_memory_efficient
+        attn_pool_text=False,
+        memory_efficient=not args.no_memory_efficient,
+        self_cond=args.self_cond
     )
 
     unets = [unet1]
@@ -341,7 +371,8 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             layer_attns=(False, False, False, i < 2),
             layer_cross_attns=(False, False, True, True),
             # final_conv_kernel_size=1,
-            memory_efficient=True
+            memory_efficient=True,
+            self_cond=args.self_cond
         )
 
         unets.append(unet2)
@@ -362,7 +393,8 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             image_sizes=image_sizes,
             per_sample_random_aug_noise_level=True,
             sigma_max = args.sigma_max,
-            cond_drop_prob=0.1
+            cond_drop_prob=0,
+            use_style=args.style is not None
         ).create().to(args.device)
 
     else:
@@ -373,26 +405,31 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             pred_objectives=["noise", "x_start"],
             image_sizes=image_sizes,
             per_sample_random_aug_noise_level=True,
-            lowres_sample_noise_level=0.3
+            lowres_sample_noise_level=0.3,
+            loss_type=args.loss,
+            use_style=args.style is not None
         ).create().to(args.device)
 
     return imagen
 
 
-def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
+def make_training_samples(cond_images, styles, trainer, args, epoch, step, epoch_loss):
+    
     sample_texts = ['1girl, red_bikini, bikini, swimsuit, outdoors, pool, brown_hair',
                     '1girl, blue_dress, eyes_closed, blonde_hair',
                     '1boy, black_hair',
                     '1girl, wristwatch, red_hair']
 
     disp_size = min(args.batch_size, 4)
-    sample_poses = None
+    
+    sample_cond_images = None
+    sample_style_images = None
 
-    if poses is not None:
-        sample_poses = poses[:disp_size]
+    if cond_images is not None:
+        sample_cond_images = cond_images[:disp_size]
 
-    if poses is not None and sample_poses is None:
-        sample_poses = poses[:disp_size]
+    if styles is not None:
+        sample_style_images = styles[:disp_size]
 
     # dup the sampler's image sizes temporarily:
     args.train = False
@@ -413,7 +450,8 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
     with trainer.accelerator.autocast():
         sample_images = trainer.sample(texts=sample_texts,
                                        text_embeds=text_embeds,
-                                       cond_images=sample_poses,
+                                       styles=sample_style_images,
+                                       cond_images=sample_cond_images,
                                        cond_scale=args.cond_scale,
                                        return_all_unet_outputs=True,
                                        stop_at_unet_number=args.train_unet)
@@ -438,8 +476,12 @@ def make_training_samples(poses, trainer, args, epoch, step, epoch_loss):
         sample_images = sample_images[0]
         sample_images = transforms.Resize(args.size)(sample_images)
 
-    if poses is not None:
-        sample_poses0 = transforms.Resize(args.size)(sample_poses)
+    if cond_images is not None:
+        sample_poses0 = transforms.Resize(args.size)(sample_cond_images)
+        sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
+
+    if styles is not None:
+        sample_poses0 = transforms.Resize(args.size)(sample_style_images)
         sample_images = torch.cat([sample_images.cpu(), sample_poses0.cpu()])
 
     grid = make_grid(sample_images, nrow=disp_size, normalize=False, range=(-1, 1))
@@ -462,7 +504,7 @@ def train(args):
     elif args.bf16:
         precision = "bf16"
 
-    trainer = ImagenTrainer(imagen, fp16=args.fp16)
+    trainer = ImagenTrainer(imagen, precision=precision, lr=args.lr)
 
     if args.imagen is not None and os.path.isfile(args.imagen):
         print(f"Loading model: {args.imagen}")
@@ -481,17 +523,30 @@ def train(args):
     print(f"{len(txts)} tags")
 
     cond_images = None
-    has_poses = False
+    has_cond = False
+    style_images = None
+    has_style = False
 
     if args.cond_images is not None:
         cond_images = get_images(args.cond_images)
-        has_poses = True
+        print(f"{len(cond_images)} conditional images")
+        has_cond = True
+
+    if args.style is not None:
+        style_images = get_images(args.style)
+        print(f"{len(style_images)} style images")
+        has_style = True
 
     # get non-training sizes for image resizing/cropping
     args.train = False
     train_img_size = get_image_sizes(args)[args.train_unet - 1]
 
     tforms = transforms.Compose([
+            PadImage(),
+            transforms.Resize(train_img_size, interpolation=transforms.InterpolationMode.LANCZOS),
+            transforms.ToTensor()])
+
+    alt_tforms = transforms.Compose([
             PadImage(),
             transforms.Resize(train_img_size, interpolation=transforms.InterpolationMode.LANCZOS),
             transforms.ToTensor()])
@@ -528,9 +583,11 @@ def train(args):
         tag_transform = None
 
     data = ImageLabelDataset(imgs, txts, None,
-                             poses=cond_images,
+                             styles=style_images,
+                             cond_images=cond_images,
                              dim=(args.size, args.size),
                              transform=tforms,
+                             alt_transform=alt_tforms,
                              tag_transform=tag_transform,
                              channels_first=True,
                              return_raw_txt=True,
@@ -554,11 +611,17 @@ def train(args):
         with tqdm(dl, unit="batches") as tepoch:
             for data in tepoch:
 
-                if has_poses:
-                    images, texts, cond_images = data
-                else:
-                    images, texts = data
-                    cond_images = None
+                cond_images = None
+                style_images = None
+
+                images = data.pop(0)
+                texts = data.pop(0)
+
+                if has_style:
+                    style_images = data.pop(0)
+
+                if has_cond:
+                    cond_images = data.pop(0)
 
                 step += 1
 
@@ -572,6 +635,7 @@ def train(args):
                 try:
                     loss = trainer(
                         images,
+                        styles=style_images,
                         cond_images=cond_images,
                         texts=texts,
                         text_embeds=txt_embeds,
@@ -585,14 +649,17 @@ def train(args):
                 trainer.update(unet_number=args.train_unet)
 
                 epoch_loss += loss
-                epoch_loss_disp = round(float(epoch_loss) / float(step), 5)
+                epoch_loss_disp = round(float(epoch_loss) / float(step), 6)
 
                 tepoch.set_description(f"Epoch {epoch}")
-                tepoch.set_postfix(loss=round(loss, 5), epoch_loss=epoch_loss_disp)
+                tepoch.set_postfix(loss=round(loss, 6), epoch_loss=epoch_loss_disp)
 
-                if step % 100 == 0:
+                if args.wandb:
+                    wandb.log({"loss": loss, "epoch_loss": epoch_loss_disp})
+
+                if step % args.sample_rate == 0:
                     if not args.no_sample:
-                        make_training_samples(cond_images, trainer, args, epoch,
+                        make_training_samples(cond_images, style_images, trainer, args, epoch,
                                               trainer.num_steps_taken(args.train_unet),
                                               epoch_loss_disp)
 
@@ -600,12 +667,16 @@ def train(args):
                         trainer.save(args.imagen)
         # END OF EPOCH
         if not args.no_sample:
-            make_training_samples(cond_images, trainer, args, epoch,
+            make_training_samples(cond_images, style_images, trainer, args, epoch,
                                   trainer.num_steps_taken(args.train_unet),
                                   epoch_loss_disp)
 
         if args.imagen is not None:
             trainer.save(args.imagen)
+
+            if args.device == "cuda":
+                # prevents OOM on memory constrained devices
+                torch.cuda.empty_cache()
 
 
 class LineByLineTextDataset(Dataset):
@@ -636,6 +707,10 @@ def train_tokenizer(args):
 
     if args.vocab is None:
         args.vocab = args.tags_source
+
+    output_file = os.path.join(args.text_encoder, "t5_model.spm")
+    if os.path.isfile(output_file):
+        return output_file
 
     os.makedirs(args.text_encoder, exist_ok=True)
 
@@ -677,8 +752,6 @@ def train_tokenizer(args):
                                    model_type='unigram',
                                    vocab_size=len(vocab) // 2)
 
-    output_file = os.path.join(args.text_encoder, "t5_model.spm")
-
     with open(output_file, 'wb') as f:
         f.write(model.getvalue())
 
@@ -711,6 +784,11 @@ def train_encoder(args):
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
+    resume_from_checkpoint = None
+
+    if os.path.isfile(os.path.join(args.text_encoder, "config.json")):
+        resume_from_checkpoint = args.text_encoder
+
     training_args = TrainingArguments(
                                       output_dir=args.text_encoder,
                                       evaluation_strategy="epoch",
@@ -731,7 +809,7 @@ def train_encoder(args):
                       data_collator=data_collator,
                      )
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     except KeyboardInterrupt:
         print("Training cancelled by user.")
 
