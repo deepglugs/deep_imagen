@@ -393,8 +393,7 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             image_sizes=image_sizes,
             per_sample_random_aug_noise_level=True,
             sigma_max = args.sigma_max,
-            cond_drop_prob=0,
-            use_style=args.style is not None
+            cond_drop_prob=0
         ).create().to(args.device)
 
     else:
@@ -406,8 +405,7 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             image_sizes=image_sizes,
             per_sample_random_aug_noise_level=True,
             lowres_sample_noise_level=0.3,
-            loss_type=args.loss,
-            use_style=args.style is not None
+            loss_type=args.loss
         ).create().to(args.device)
 
     return imagen
