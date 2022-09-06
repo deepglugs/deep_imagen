@@ -142,6 +142,8 @@ def main():
     parser.add_argument('--sample_rate', default=100, type=int)
     parser.add_argument('--wandb', action='store_true',
                         help="use wandb logging")
+    parser.add_argument('--is_t5', action='store_true',
+                        help="t5-like encoder")
 
     args = parser.parse_args()
 
@@ -250,7 +252,6 @@ def sample(args):
     sample_images = imagen.sample(texts=sample_texts,
                                   text_embeds=text_embeds,
                                   cond_images=cond_image,
-                                  styles=style_image,
                                   cond_scale=args.cond_scale,
                                   init_images=init_image,
                                   skip_steps=args.skip_steps,
@@ -448,7 +449,6 @@ def make_training_samples(cond_images, styles, trainer, args, epoch, step, epoch
     with trainer.accelerator.autocast():
         sample_images = trainer.sample(texts=sample_texts,
                                        text_embeds=text_embeds,
-                                       styles=sample_style_images,
                                        cond_images=sample_cond_images,
                                        cond_scale=args.cond_scale,
                                        return_all_unet_outputs=True,
@@ -513,7 +513,7 @@ def train(args):
     imgs = get_images(args.source, verify=args.verify_images)
 
     if args.embeddings is not None:
-        txts = get_images(args.embeddings, exts=".npy")
+        txts = get_images(args.embeddings, exts=".npz")
     else:
         txts = get_images(args.tags_source, exts=".txt")
 
@@ -597,6 +597,8 @@ def train(args):
                                      shuffle=True,
                                      num_workers=args.workers)
 
+    # dl = trainer.accelerator.prepare(dl)
+
     rate = deque([1], maxlen=5)
 
     os.makedirs(args.samples_out, exist_ok=True)
@@ -633,7 +635,6 @@ def train(args):
                 try:
                     loss = trainer(
                         images,
-                        styles=style_images,
                         cond_images=cond_images,
                         texts=texts,
                         text_embeds=txt_embeds,
@@ -824,10 +825,13 @@ def get_text_embeddings(txts, tokenizer=None, model=None, text_encoder=None):
         tokenizer.padding_side = "right"
         tokenizer.pad_token = tokenizer.eos_token
 
-    toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device)
+    #toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device)
+    
+    toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device).input_ids
 
     with torch.no_grad():
         last_hidden_state = model(**toks, output_hidden_states=True, return_dict=True).last_hidden_state
+
 
     weights = torch.arange(start=1, end=last_hidden_state.shape[1] + 1).unsqueeze(-1).expand(last_hidden_state.size()).float()
     weights = weights.to(last_hidden_state.device)
@@ -842,11 +846,20 @@ def get_text_embeddings(txts, tokenizer=None, model=None, text_encoder=None):
 
     return embeddings
 
+
+def get_text_embeddings_t5(txts, text_encoder):
+    from imagen_pytorch.t5 import t5_encode_text
+
+    return t5_encode_text(txts, name=text_encoder).cpu().detach().numpy()
+
+
 def create_embeddings(args):
     from transformers import AutoModel, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.text_encoder)
     model = AutoModel.from_pretrained(args.text_encoder).to(args.device)
+
+    print("fetching tags...")
 
     txts = get_images(args.tags_source, exts=".txt")
 
@@ -858,15 +871,17 @@ def create_embeddings(args):
     if args.output is not None:
         os.makedirs(args.output, exist_ok=True)
 
+    print("encoding...")
+
     for txt in tqdm(txts):
 
         basepath = os.path.dirname(txt)
         bn = os.path.splitext(os.path.basename(txt))[0]
 
         if args.output is None:
-            out_file = os.path.join(basepath, f"{bn}.npy")
+            out_file = os.path.join(basepath, f"{bn}.npz")
         else:
-            out_file = os.path.join(args.output, f"{bn}.npy")
+            out_file = os.path.join(args.output, f"{bn}.npz")
 
         if os.path.isfile(out_file) and not args.replace:
             continue
@@ -878,9 +893,12 @@ def create_embeddings(args):
             empties.append(txt)
             continue
 
-        embeddings = get_text_embeddings(data, tokenizer, model)
+        if args.is_t5:
+            embeddings = get_text_embeddings_t5(data, args.text_encoder)
+        else:
+            embeddings = get_text_embeddings(data, tokenizer, model)
 
-        np.save(out_file, embeddings)
+        np.savez_compressed(out_file, embeddings)
 
     with open("empties.txt", 'w') as f:
         f.write("\n".join(empties))
