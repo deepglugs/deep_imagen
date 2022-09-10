@@ -325,7 +325,9 @@ class ImageLabelDataset():
             try:
                 txt = txts[bn]
                 if self.use_text_encodings:
-                    oh = np.load(txt)
+                    with np.load(txt) as data:
+                        oh = data['arr_0']
+                        # print(oh)
                 else:
                     with open(txt, 'r', encoding="utf-8") as f:
                         try:

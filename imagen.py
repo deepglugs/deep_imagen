@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import io
 import math
 import numbers
 import os
@@ -11,6 +12,8 @@ from collections import deque
 
 import numpy as np
 import torch
+import webdataset as wds
+
 from functools import reduce
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -144,6 +147,7 @@ def main():
                         help="use wandb logging")
     parser.add_argument('--is_t5', action='store_true',
                         help="t5-like encoder")
+    parser.add_argument('--webdataset', action='store_true')
 
     args = parser.parse_args()
 
@@ -371,7 +375,9 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
             num_resnet_blocks=2,
             layer_attns=(False, False, False, i < 2),
             layer_cross_attns=(False, False, True, True),
+            use_global_context_attn=False,
             # final_conv_kernel_size=1,
+            attn_pool_text=False,
             memory_efficient=True,
             self_cond=args.self_cond
         )
@@ -418,6 +424,11 @@ def make_training_samples(cond_images, styles, trainer, args, epoch, step, epoch
                     '1girl, blue_dress, eyes_closed, blonde_hair',
                     '1boy, black_hair',
                     '1girl, wristwatch, red_hair']
+
+    trainer.accelerator.wait_for_everyone()
+
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
 
     disp_size = min(args.batch_size, 4)
     
@@ -490,6 +501,42 @@ def delete_random_elems(input_list, n):
     to_delete = set(random.sample(range(len(input_list)), n))
     return [x for i,x in enumerate(input_list) if not i in to_delete]
 
+def my_split_by_node(urls):
+    node_id, node_count = torch.distributed.get_rank(), torch.distributed.get_world_size()
+    return urls[node_id::node_count]
+
+def create_webdataset(
+                urls,
+                image_transform,
+                txt_transform,
+                enable_text=True,
+                enable_image=True,
+                image_key='jpg',
+                caption_key='txt',
+                cache_path=None,):
+
+    dataset = wds.WebDataset(urls,
+                             nodesplitter=wds.split_by_node,
+                             cache_dir=cache_path,
+                             cache_size=10**10,
+                             handler=wds.handlers.warn_and_continue)
+
+    def preprocess_dataset(item):
+        # print(item.keys())
+        if enable_image:
+            image_data = item[image_key]
+            image = Image.open(io.BytesIO(image_data))
+            image_tensor = image_transform(image)
+            
+        if enable_text:
+            text = item[caption_key]
+            caption = text.decode("utf-8") 
+            transformed_text = txt_transform(caption)
+
+        return (image_tensor, transformed_text)
+
+    transformed_dataset = dataset.shuffle(1000).map(preprocess_dataset, handler=wds.handlers.warn_and_continue)
+    return transformed_dataset
 
 def train(args):
 
@@ -510,15 +557,16 @@ def train(args):
 
     print(f"Fetching image indexes in {args.source}...")
 
-    imgs = get_images(args.source, verify=args.verify_images)
+    if not args.webdataset:
+        imgs = get_images(args.source, verify=args.verify_images)
 
-    if args.embeddings is not None:
-        txts = get_images(args.embeddings, exts=".npz")
-    else:
-        txts = get_images(args.tags_source, exts=".txt")
+        if args.embeddings is not None:
+            txts = get_images(args.embeddings, exts=".npz")
+        else:
+            txts = get_images(args.tags_source, exts=".txt")
 
-    print(f"{len(imgs)} images")
-    print(f"{len(txts)} tags")
+        print(f"{len(imgs)} images")
+        print(f"{len(txts)} tags")
 
     cond_images = None
     has_cond = False
@@ -580,35 +628,38 @@ def train(args):
     if args.no_text_transform:
         tag_transform = None
 
-    data = ImageLabelDataset(imgs, txts, None,
-                             styles=style_images,
-                             cond_images=cond_images,
-                             dim=(args.size, args.size),
-                             transform=tforms,
-                             alt_transform=alt_tforms,
-                             tag_transform=tag_transform,
-                             channels_first=True,
-                             return_raw_txt=True,
-                             no_preload=True,
-                             use_text_encodings=args.embeddings is not None)
+    if args.webdataset:
+        data = create_webdataset(args.source, tforms, txt_xforms)
+        dl = torch.utils.data.DataLoader(data,
+                                         batch_size=args.batch_size,
+                                         num_workers=args.workers)
+    else:
+        data = ImageLabelDataset(imgs, txts, None,
+                                 styles=style_images,
+                                 cond_images=cond_images,
+                                 dim=(args.size, args.size),
+                                 transform=tforms,
+                                 alt_transform=alt_tforms,
+                                 tag_transform=tag_transform,
+                                 channels_first=True,
+                                 return_raw_txt=True,
+                                 no_preload=True,
+                                 use_text_encodings=args.embeddings is not None)
 
-    dl = torch.utils.data.DataLoader(data,
-                                     batch_size=args.batch_size,
-                                     shuffle=True,
-                                     num_workers=args.workers)
+        dl = torch.utils.data.DataLoader(data,
+                                         batch_size=args.batch_size,
+                                         shuffle=True,
+                                         num_workers=args.workers,
+                                         pin_memory=True)
 
-    # dl = trainer.accelerator.prepare(dl)
-
-    rate = deque([1], maxlen=5)
+    dl = trainer.accelerator.prepare(dl)
 
     os.makedirs(args.samples_out, exist_ok=True)
-
-    print(f"training on {len(data)} images")
 
     for epoch in range(args.start_epoch, args.epochs + 1):
         step = 0
         epoch_loss = 0
-        with tqdm(dl, unit="batches") as tepoch:
+        with tqdm(dl, unit="batches", disable=not trainer.accelerator.is_local_main_process) as tepoch:
             for data in tepoch:
 
                 cond_images = None
@@ -661,7 +712,6 @@ def train(args):
                         make_training_samples(cond_images, style_images, trainer, args, epoch,
                                               trainer.num_steps_taken(args.train_unet),
                                               epoch_loss_disp)
-
                     if args.imagen is not None:
                         trainer.save(args.imagen)
         # END OF EPOCH
@@ -825,9 +875,7 @@ def get_text_embeddings(txts, tokenizer=None, model=None, text_encoder=None):
         tokenizer.padding_side = "right"
         tokenizer.pad_token = tokenizer.eos_token
 
-    #toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device)
-    
-    toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device).input_ids
+    toks = tokenizer(txts, padding=True, truncation=True, return_tensors="pt").to(model.device)
 
     with torch.no_grad():
         last_hidden_state = model(**toks, output_hidden_states=True, return_dict=True).last_hidden_state
@@ -895,6 +943,7 @@ def create_embeddings(args):
 
         if args.is_t5:
             embeddings = get_text_embeddings_t5(data, args.text_encoder)
+            print(embeddings.shape)
         else:
             embeddings = get_text_embeddings(data, tokenizer, model)
 
