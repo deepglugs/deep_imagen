@@ -639,7 +639,6 @@ def train(args):
                                          num_workers=args.workers)
     else:
         data = ImageLabelDataset(imgs, txts, None,
-                                 styles=style_images,
                                  cond_images=cond_images,
                                  dim=(args.size, args.size),
                                  transform=tforms,
