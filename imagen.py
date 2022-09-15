@@ -86,7 +86,9 @@ def main():
     parser.add_argument('--source', type=str, default=None, help="image source")
     parser.add_argument('--tags_source', type=str, default=None, help="tag files. will use --source if not specified.")
     parser.add_argument('--cond_images', type=str, default=None)
-    parser.add_argument('--style', type=str, default=None)
+    parser.add_argument("--init_image", default=None,)
+    parser.add_argument("--start_image", default=None,
+                        help="starting image, for super resolution unets")
     parser.add_argument('--embeddings', type=str, default=None)
     parser.add_argument('--tags', type=str, default=None)
     parser.add_argument('--vocab', default=None)
@@ -108,7 +110,6 @@ def main():
     parser.add_argument("--cond_scale", default=0.7, type=float, help="sampling conditional scale 0-10.0")
     parser.add_argument('--no_elu', action='store_true', help="don't use elucidated imagen")
     parser.add_argument("--num_samples", default=1, type=int)
-    parser.add_argument("--init_image", default=None,)
     parser.add_argument("--skip_steps", default=None, type=int)
     parser.add_argument("--sigma_max", default=80, type=float)
     parser.add_argument("--full_load", action="store_true",
@@ -148,6 +149,8 @@ def main():
     parser.add_argument('--is_t5', action='store_true',
                         help="t5-like encoder")
     parser.add_argument('--webdataset', action='store_true')
+    parser.add_argument('--null_unet1', action='store_true',
+                        help="use NullUnet() for unet1 (for superrez only model)")
 
     args = parser.parse_args()
 
@@ -230,17 +233,6 @@ def sample(args):
         init_image = torch.unsqueeze(init_image, 0)
         init_image = init_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
 
-    style_image = None
-
-    if args.style is not None and os.path.isfile(args.style):
-        tforms = transforms.Compose([PadImage(),
-                                     transforms.Resize((args.size, args.size)),
-                                     transforms.ToTensor()])
-        style_image = Image.open(args.style)
-        style_image = tforms(style_image).to(imagen.device)
-        style_image = torch.unsqueeze(style_image, 0)
-        style_image = style_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
-
     text_embeds = None
     sample_texts = args.tags
     if args.embeddings is not None:
@@ -253,6 +245,18 @@ def sample(args):
     else:
         sample_texts = list(np.repeat(sample_texts, args.num_samples))
 
+    start_unet = 1
+    start_image = None
+
+    if args.start_image is not None:
+        tforms = transforms.Compose([PadImage(),
+                                     transforms.ToTensor()])
+        start_unet = args.sample_unet
+        start_image = Image.open(args.start_image)
+        start_image = tforms(start_image).to(imagen.device)
+        start_image = torch.unsqueeze(start_image, 0)
+        start_image = start_image.repeat(args.num_samples, 1, 1, 1).to(args.device)
+
     sample_images = imagen.sample(texts=sample_texts,
                                   text_embeds=text_embeds,
                                   cond_images=cond_image,
@@ -260,8 +264,10 @@ def sample(args):
                                   init_images=init_image,
                                   skip_steps=args.skip_steps,
                                   sigma_max=args.sigma_max,
-                                  return_pil_images=True,
-                                  stop_at_unet_number=args.sample_unet)
+                                  stop_at_unet_number=args.sample_unet,
+                                  start_at_unet_number=start_unet,
+                                  start_image_or_video=start_image,
+                                  return_pil_images=True)
 
     for i, sample in enumerate(sample_images):
         final_image = sample
@@ -363,6 +369,9 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
         self_cond=args.self_cond
     )
 
+    if args.null_unet1:
+        unet1 = dict(is_null=True)
+
     unets = [unet1]
 
     for i in range(args.num_unets):
@@ -420,7 +429,7 @@ def get_imagen(args, unet_dims=None, unet2_dims=None):
 
 def make_training_samples(cond_images, styles, trainer, args, epoch, step, epoch_loss):
     
-    sample_texts = ['1girl, red_bikini, bikini, swimsuit, outdoors, pool, brown_hair',
+    sample_texts = ['1girl, red_bikini, outdoors, pool, brown_hair',
                     '1girl, blue_dress, eyes_closed, blonde_hair',
                     '1boy, black_hair',
                     '1girl, wristwatch, red_hair']
@@ -577,11 +586,6 @@ def train(args):
         cond_images = get_images(args.cond_images)
         print(f"{len(cond_images)} conditional images")
         has_cond = True
-
-    if args.style is not None:
-        style_images = get_images(args.style)
-        print(f"{len(style_images)} style images")
-        has_style = True
 
     # get non-training sizes for image resizing/cropping
     args.train = False
